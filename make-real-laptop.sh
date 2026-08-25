@@ -30,10 +30,12 @@
 #      break GPU, disk, USB, and VMware Tools).
 #   7. spoofs SCSI model/vendor in sysfs + wraps lsblk (VMware Virtual disk /
 #      NECVMWar CD). Does not change WWN / by-id (that would break fstab).
-#   8. wraps ps so vmtoolsd is not listed. The daemon stays running — do not
-#      stop open-vm-tools (clipboard, display, Tools would break). pgrep is
-#      left alone so Tools can still find itself.
+#   8. wraps ps so vmtoolsd is not listed. pgrep is left alone.
 #   9. wraps ethtool so vmxnet3 is printed as e1000e.
+#  10. runs Tools under a bland process name (gsd-disk-mon) and plugin/config
+#      dirs (gsd-hw-helper / hw-assist-cfg). Original package paths stay for
+#      apt; Files/Nautilus hides them via .hidden. Do not uninstall
+#      open-vm-tools — clipboard and display need it.
 #
 set -euo pipefail
 
@@ -71,6 +73,20 @@ BLOCK_DISK_REV="5L2Q"
 BLOCK_CD_VENDOR="HL-DT-ST"
 BLOCK_CD_MODEL="DVDRAM GUE0N"
 BLOCK_CD_REV="1.00"
+
+# open-vm-tools camouflage. Process name is the ELF filename (15-char comm).
+# Do not rename the package files in place — apt would break on the next
+# upgrade. Copies + a vmtoolsd trampoline keep Tools working.
+TOOLS_CAMO_BIN="/usr/libexec/gsd-disk-mon"
+TOOLS_CAMO_AUTH="/usr/libexec/gsd-auth-mon"
+TOOLS_CAMO_PLUGIN="/usr/lib/gsd-hw-helper"
+TOOLS_CAMO_CONF="/etc/hw-assist-cfg"
+VMTOOLSD_BIN="/usr/bin/vmtoolsd"
+VMTOOLSD_REAL="/usr/bin/vmtoolsd.real"
+VGAUTH_BIN="/usr/bin/VGAuthService"
+VGAUTH_REAL="/usr/bin/VGAuthService.real"
+AUTOSTART_DESKTOP="/etc/xdg/autostart/vmware-user.desktop"
+AUTOSTART_DESKTOP_REAL="/etc/xdg/autostart/vmware-user.desktop.real"
 
 # Real Latitude 5540 SMBIOS strings (public Dell laptop identity).
 DMI_SYS_VENDOR="Dell Inc."
@@ -335,6 +351,238 @@ unmount_block_identity() {
   fi
 }
 
+is_elf() {
+  [[ -f "$1" ]] || return 1
+  [[ "$(head -c 4 "$1" 2>/dev/null || true)" == $'\x7fELF' ]]
+}
+
+find_ovt_plugin_root() {
+  local d arch=""
+  arch="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+  [[ -n "${arch}" ]] || arch="$(uname -m | sed 's/x86_64/x86_64-linux-gnu/;s/aarch64/aarch64-linux-gnu/')"
+  for d in \
+    "/usr/lib/${arch}/open-vm-tools" \
+    /usr/lib/x86_64-linux-gnu/open-vm-tools \
+    /usr/lib/aarch64-linux-gnu/open-vm-tools \
+    /usr/lib/open-vm-tools
+  do
+    if [[ -d "${d}/plugins" ]]; then
+      printf '%s\n' "${d}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+nautilus_hide() {
+  local dir="$1" name="$2" f list
+  [[ -d "${dir}" ]] || return 0
+  mkdir -p "${STATE_DIR}"
+  list="${STATE_DIR}/nautilus-hidden"
+  f="${dir}/.hidden"
+  if [[ -f "${f}" ]] && grep -qxF "${name}" "${f}"; then
+    grep -qxF "${dir}|${name}" "${list}" 2>/dev/null || echo "${dir}|${name}" >>"${list}"
+    return 0
+  fi
+  echo "${name}" >>"${f}"
+  chmod 644 "${f}" 2>/dev/null || true
+  grep -qxF "${dir}|${name}" "${list}" 2>/dev/null || echo "${dir}|${name}" >>"${list}"
+}
+
+nautilus_unhide_all() {
+  local list="${STATE_DIR}/nautilus-hidden" dir name f tmp
+  [[ -f "${list}" ]] || return 0
+  while IFS='|' read -r dir name; do
+    [[ -n "${dir}" && -n "${name}" ]] || continue
+    f="${dir}/.hidden"
+    [[ -f "${f}" ]] || continue
+    tmp="${f}.mrl.$$"
+    grep -vxF "${name}" "${f}" >"${tmp}" || true
+    if [[ -s "${tmp}" ]]; then
+      mv -f "${tmp}" "${f}"
+    else
+      rm -f "${tmp}" "${f}"
+    fi
+  done <"${list}"
+  rm -f "${list}"
+}
+
+write_vmtoolsd_trampoline() {
+  cat >"${VMTOOLSD_BIN}" <<EOF
+#!/bin/sh
+# Installed by make-real-laptop.sh
+bin='${TOOLS_CAMO_BIN}'
+conf='${TOOLS_CAMO_CONF}/tools.conf'
+common='${TOOLS_CAMO_PLUGIN}/plugins/common'
+name=vmsvc
+prev=
+for a in "\$@"; do
+  case "\${prev}" in
+    -n|--name) name=\${a} ;;
+  esac
+  case "\${a}" in
+    --name=*) name=\${a#--name=} ;;
+  esac
+  prev=\${a}
+done
+plugin='${TOOLS_CAMO_PLUGIN}/plugins/'"\${name}"
+exec "\${bin}" --config "\${conf}" --common-path "\${common}" --plugin-path "\${plugin}" "\$@"
+EOF
+  chmod 755 "${VMTOOLSD_BIN}"
+}
+
+apply_tools_camouflage() {
+  local src plugin_src conf_src
+  [[ -e "${VMTOOLSD_BIN}" || -e "${VMTOOLSD_REAL}" ]] || return 0
+
+  mkdir -p "${STATE_DIR}" /usr/libexec "${TOOLS_CAMO_PLUGIN}" "${TOOLS_CAMO_CONF}"
+
+  if [[ -e "${VMTOOLSD_REAL}" ]] && is_elf "${VMTOOLSD_REAL}"; then
+    src="${VMTOOLSD_REAL}"
+  elif is_elf "${VMTOOLSD_BIN}"; then
+    src="${VMTOOLSD_BIN}"
+  elif [[ -e "${VMTOOLSD_REAL}" ]]; then
+    src="${VMTOOLSD_REAL}"
+  else
+    src="${VMTOOLSD_BIN}"
+  fi
+  if is_elf "${src}"; then
+    if [[ ! -e "${TOOLS_CAMO_BIN}" || "${src}" -nt "${TOOLS_CAMO_BIN}" ]]; then
+      cp -a "${src}" "${TOOLS_CAMO_BIN}"
+      chmod 755 "${TOOLS_CAMO_BIN}"
+    fi
+  fi
+  [[ -x "${TOOLS_CAMO_BIN}" ]] || return 0
+
+  plugin_src="$(find_ovt_plugin_root || true)"
+  if [[ -n "${plugin_src}" && -d "${plugin_src}" ]]; then
+    mkdir -p "${TOOLS_CAMO_PLUGIN}"
+    if [[ ! -d "${TOOLS_CAMO_PLUGIN}/plugins/vmsvc" || "${src}" -nt "${TOOLS_CAMO_PLUGIN}/plugins" ]]; then
+      cp -a "${plugin_src}/." "${TOOLS_CAMO_PLUGIN}/"
+    fi
+  fi
+
+  conf_src="/etc/vmware-tools"
+  if [[ -d "${conf_src}" ]] && ! findmnt -n "${conf_src}" >/dev/null 2>&1; then
+    mkdir -p "${TOOLS_CAMO_CONF}"
+    cp -a "${conf_src}/." "${TOOLS_CAMO_CONF}/" 2>/dev/null || true
+  fi
+
+  ensure_divert "${VMTOOLSD_BIN}" "${VMTOOLSD_REAL}"
+  write_vmtoolsd_trampoline
+
+  if [[ -e "${VGAUTH_BIN}" || -e "${VGAUTH_REAL}" ]]; then
+    if [[ -e "${VGAUTH_REAL}" ]] && is_elf "${VGAUTH_REAL}"; then
+      src="${VGAUTH_REAL}"
+    elif is_elf "${VGAUTH_BIN}"; then
+      src="${VGAUTH_BIN}"
+    else
+      src=""
+    fi
+    if [[ -n "${src}" ]]; then
+      if [[ ! -e "${TOOLS_CAMO_AUTH}" || "${src}" -nt "${TOOLS_CAMO_AUTH}" ]]; then
+        cp -a "${src}" "${TOOLS_CAMO_AUTH}"
+        chmod 755 "${TOOLS_CAMO_AUTH}"
+      fi
+      ensure_divert "${VGAUTH_BIN}" "${VGAUTH_REAL}"
+      cat >"${VGAUTH_BIN}" <<EOF
+#!/bin/sh
+exec '${TOOLS_CAMO_AUTH}' "\$@"
+EOF
+      chmod 755 "${VGAUTH_BIN}"
+    fi
+  fi
+
+  if [[ -e "${AUTOSTART_DESKTOP}" || -e "${AUTOSTART_DESKTOP_REAL}" ]]; then
+    ensure_divert "${AUTOSTART_DESKTOP}" "${AUTOSTART_DESKTOP_REAL}"
+    cat >"${AUTOSTART_DESKTOP}" <<'EOF'
+[Desktop Entry]
+Type=Application
+Encoding=UTF-8
+Name=Session display helper
+Comment=Display and clipboard helper
+Exec=/usr/bin/vmware-user-suid-wrapper
+NoDisplay=true
+X-GNOME-Autostart-Phase=Initialization
+X-KDE-autostart-phase=1
+EOF
+    chmod 644 "${AUTOSTART_DESKTOP}"
+  fi
+
+  if [[ -d /etc/apparmor.d ]]; then
+    mkdir -p /etc/apparmor.d/local
+    cat >/etc/apparmor.d/local/make-real-laptop-tools <<EOF
+# Loaded via usr.bin.vmtoolsd local include if that profile exists.
+/usr/libexec/gsd-disk-mon mrix,
+/usr/libexec/gsd-auth-mon mrix,
+/usr/lib/gsd-hw-helper/** r,
+/usr/lib/gsd-hw-helper/**/*.so m,
+/etc/hw-assist-cfg/** r,
+EOF
+    if [[ -f /etc/apparmor.d/usr.bin.vmtoolsd ]]; then
+      if ! grep -q 'make-real-laptop-tools' /etc/apparmor.d/usr.bin.vmtoolsd 2>/dev/null; then
+        # Ubuntu profiles typically include <local/NAME>. Drop a local file
+        # that the stock include already picks up.
+        :
+      fi
+      if [[ ! -f /etc/apparmor.d/local/usr.bin.vmtoolsd ]] || ! grep -q gsd-disk-mon /etc/apparmor.d/local/usr.bin.vmtoolsd 2>/dev/null; then
+        cat >>/etc/apparmor.d/local/usr.bin.vmtoolsd <<'EOF'
+# make-real-laptop.sh
+/usr/libexec/gsd-disk-mon mrix,
+/usr/lib/gsd-hw-helper/** r,
+/usr/lib/gsd-hw-helper/**/*.so m,
+/etc/hw-assist-cfg/** r,
+EOF
+      fi
+      apparmor_parser -r /etc/apparmor.d/usr.bin.vmtoolsd 2>/dev/null || true
+    fi
+  fi
+
+  nautilus_hide /usr/lib open-vm-tools
+  nautilus_hide /usr/lib/x86_64-linux-gnu open-vm-tools
+  nautilus_hide /usr/lib/aarch64-linux-gnu open-vm-tools
+  nautilus_hide /usr/share open-vm-tools
+  nautilus_hide /usr/share/doc open-vm-tools
+  nautilus_hide /etc vmware-tools
+  nautilus_hide /etc vmware
+  nautilus_hide /usr/bin vmtoolsd
+  nautilus_hide /usr/bin vmware-user
+  nautilus_hide /usr/bin vmware-user-suid-wrapper
+  nautilus_hide /usr/bin vmware-rpctool
+  nautilus_hide /usr/bin vmware-checkvm
+  nautilus_hide /usr/bin vmware-toolbox-cmd
+  nautilus_hide /usr/bin vmware-hgfsclient
+  nautilus_hide /usr/bin vmware-xferlogs
+  nautilus_hide /usr/bin VGAuthService
+  nautilus_hide /usr/bin vmhgfs-fuse
+  nautilus_hide /etc/xdg/autostart vmware-user.desktop
+
+  if [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]]; then
+    systemctl try-restart vgauth.service open-vm-tools.service 2>/dev/null || true
+  fi
+}
+
+remove_tools_camouflage() {
+  nautilus_unhide_all
+  remove_divert "${VMTOOLSD_BIN}" "${VMTOOLSD_REAL}"
+  remove_divert "${VGAUTH_BIN}" "${VGAUTH_REAL}"
+  remove_divert "${AUTOSTART_DESKTOP}" "${AUTOSTART_DESKTOP_REAL}"
+  rm -f "${TOOLS_CAMO_BIN}" "${TOOLS_CAMO_AUTH}"
+  rm -rf "${TOOLS_CAMO_PLUGIN}" "${TOOLS_CAMO_CONF}"
+  rm -f /etc/apparmor.d/local/make-real-laptop-tools
+  if [[ -f /etc/apparmor.d/local/usr.bin.vmtoolsd ]]; then
+    grep -v 'make-real-laptop\|gsd-disk-mon\|gsd-hw-helper\|hw-assist-cfg' \
+      /etc/apparmor.d/local/usr.bin.vmtoolsd > /etc/apparmor.d/local/usr.bin.vmtoolsd.mrl \
+      || true
+    mv -f /etc/apparmor.d/local/usr.bin.vmtoolsd.mrl /etc/apparmor.d/local/usr.bin.vmtoolsd
+    [[ -s /etc/apparmor.d/local/usr.bin.vmtoolsd ]] || rm -f /etc/apparmor.d/local/usr.bin.vmtoolsd
+    apparmor_parser -r /etc/apparmor.d/usr.bin.vmtoolsd 2>/dev/null || true
+  fi
+  if [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]]; then
+    systemctl try-restart vgauth.service open-vm-tools.service 2>/dev/null || true
+  fi
+}
+
 apply_hostname() {
   mkdir -p "${STATE_DIR}"
   if [[ ! -f "${STATE_DIR}/old-hostname" ]]; then
@@ -585,7 +833,7 @@ ConditionPathExists=${INSTALL_PATH}
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=${INSTALL_PATH} apply
-TimeoutStartSec=30
+TimeoutStartSec=90
 
 [Install]
 WantedBy=sysinit.target
@@ -607,6 +855,7 @@ Do not add these (and remove them if you already did):
   isolation.tools.getVersion.disable = "TRUE"
 
 Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, lspci, ps, lsblk, and ethtool.
+Tools still run, but under the process name gsd-disk-mon and dirs gsd-hw-helper / hw-assist-cfg.
 Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
 
 If you already added those lines: shut the VM fully off, delete them from
@@ -633,6 +882,7 @@ cmd_apply() {
   apply_cpuinfo
   hide_sys_hypervisor
   apply_block_identity
+  apply_tools_camouflage
   apply_hostname
   install_virt_wrapper
 }
@@ -652,6 +902,7 @@ cmd_install() {
   cmd_apply
   echo
   echo "installed. identity is applied and will re-apply at boot."
+  echo "Log out of GNOME (or reboot) so System Monitor drops the old vmtoolsd process."
   print_vmx_hint
   cmd_status
 }
@@ -666,6 +917,7 @@ cmd_revert() {
   done
   findmnt -n /proc/cpuinfo >/dev/null 2>&1 && umount /proc/cpuinfo 2>/dev/null || true
   unmount_block_identity
+  remove_tools_camouflage
   if [[ -d /sys/hypervisor ]] && findmnt -n /sys/hypervisor >/dev/null 2>&1; then
     [[ "$(findmnt -n -o FSTYPE /sys/hypervisor 2>/dev/null || true)" == "tmpfs" ]] \
       && umount /sys/hypervisor 2>/dev/null || true
@@ -759,6 +1011,28 @@ cmd_status() {
     case "${mac}" in
       00:0c:29:*|00:50:56:*|00:05:69:*|00:1c:14:*)
         echo "  (MAC uses a VMware OUI. Changing it in-guest can break networking; set ethernet0.address in the .vmx if you need a Dell/Intel OUI.)"
+        ;;
+    esac
+  done
+  echo
+  echo "=== tools process / dirs (System Monitor reads /proc, not ps) ==="
+  if [[ -x "${TOOLS_CAMO_BIN}" ]]; then
+    echo "camouflaged daemon:    ${TOOLS_CAMO_BIN}"
+    echo "plugin dir:            ${TOOLS_CAMO_PLUGIN}"
+    echo "config dir:            ${TOOLS_CAMO_CONF}"
+  else
+    echo "camouflaged daemon:    not installed"
+  fi
+  echo "running comm names:"
+  local comm pid
+  for pid in /proc/[0-9]*; do
+    comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+    case "${comm}" in
+      vmtoolsd|VGAuthService|vmware-user*)
+        echo "  STILL VISIBLE: ${comm}  (pid ${pid#/proc/}) — log out of GNOME or reboot"
+        ;;
+      gsd-disk-mon|gsd-auth-mon)
+        echo "  ok: ${comm}  (pid ${pid#/proc/})"
         ;;
     esac
   done
