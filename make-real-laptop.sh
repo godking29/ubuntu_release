@@ -28,8 +28,9 @@
 #   6. wraps lspci so vendor 15ad / "VMware" device names are rewritten to
 #      Intel. The real PCI IDs in sysfs are unchanged (changing them would
 #      break GPU, disk, USB, and VMware Tools).
-#   7. spoofs SCSI model/vendor in sysfs + wraps lsblk (VMware Virtual disk /
-#      NECVMWar CD). Does not change WWN / by-id (that would break fstab).
+#   7. spoofs SCSI model/vendor in sysfs + udev (so GNOME Disks / UDisks2
+#      show Samsung, not VMware). lsblk is also wrapped. Optical drive is
+#      hidden from Disks (UDISKS_IGNORE).
 #   8. wraps ps so vmtoolsd is not listed. pgrep is left alone.
 #   9. wraps ethtool so vmxnet3 is printed as e1000e.
 #  10. runs Tools under a bland process name (gsd-disk-mon) and plugin/config
@@ -63,11 +64,14 @@ ETHTOOL_REAL="/usr/sbin/ethtool.real"
 ETHTOOL_BIN_ALT="/usr/bin/ethtool"
 ETHTOOL_REAL_ALT="/usr/bin/ethtool.real"
 HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
-UDEV_DISK_RULE="/etc/udev/rules.d/61-make-real-laptop-disk.rules"
+UDEV_DISK_RULE="/etc/udev/rules.d/99-make-real-laptop-disk.rules"
+UDISKS_DROPIN="/etc/systemd/system/udisks2.service.d/make-real-laptop.conf"
+INQUIRY_SRC="${STATE_DIR}/fakeinquiry.c"
+INQUIRY_SO="/usr/lib/make-real-laptop/libfakeinquiry.so"
 HOSTNAME_NEW="dell-laptop"
 
 # SCSI INQUIRY widths: vendor 8, product 16, revision 4. Latitude 5540 NVMe.
-BLOCK_DISK_VENDOR="ATA"
+BLOCK_DISK_VENDOR="Samsung"
 BLOCK_DISK_MODEL="SAMSUNG MZVL2512"
 BLOCK_DISK_REV="5L2Q"
 BLOCK_CD_VENDOR="HL-DT-ST"
@@ -321,17 +325,165 @@ apply_block_identity() {
     kind="$(scsi_kind_from_dir "${dest}")"
     bind_scsi_attrs "${dest}" "${kind}"
   done
+  rm -f /etc/udev/rules.d/61-make-real-laptop-disk.rules
   cat >"${UDEV_DISK_RULE}" <<'EOF'
-# Installed by make-real-laptop.sh — display names only. Do not touch ID_SERIAL
-# or WWN; Ubuntu may mount by /dev/disk/by-id.
-SUBSYSTEM=="block", ENV{ID_VENDOR}=="VMware*", ENV{ID_VENDOR}="ATA", ENV{ID_MODEL}="SAMSUNG MZVL2512"
-SUBSYSTEM=="block", ENV{ID_VENDOR}=="NECVMWar*", ENV{ID_VENDOR}="HL-DT-ST", ENV{ID_MODEL}="DVDRAM GUE0N"
-SUBSYSTEM=="block", ENV{ID_MODEL}=="VMware*", ENV{ID_VENDOR}="ATA", ENV{ID_MODEL}="SAMSUNG MZVL2512"
+# Installed by make-real-laptop.sh
+# Must run AFTER 60-persistent-storage.rules (scsi_id / ata_id) so Disks/UDisks2
+# do not keep the VMware INQUIRY strings. Do not touch ID_SERIAL / WWN.
+SUBSYSTEM=="block", KERNEL=="sd*[!0-9]", \
+  ENV{ID_VENDOR}="Samsung", \
+  ENV{ID_MODEL}="SAMSUNG MZVL2512", \
+  ENV{ID_REVISION}="5L2Q", \
+  ENV{ID_VENDOR_FROM_DATABASE}="Samsung Electronics", \
+  ENV{ID_MODEL_FROM_DATABASE}="SAMSUNG MZVL2512", \
+  ENV{ID_SCSI_VENDOR}="Samsung", \
+  ENV{ID_SCSI_MODEL}="SAMSUNG MZVL2512"
+# Modern Latitude has no optical drive; hide the VMware CD from GNOME Disks.
+SUBSYSTEM=="block", KERNEL=="sr*", ENV{UDISKS_IGNORE}="1"
+SUBSYSTEM=="scsi", ATTR{vendor}=="VMware*", \
+  ENV{ID_VENDOR}="Samsung", ENV{ID_MODEL}="SAMSUNG MZVL2512"
+SUBSYSTEM=="scsi", ATTR{vendor}=="NECVMW*", ENV{UDISKS_IGNORE}="1"
 EOF
+  refresh_disk_stack
+}
+
+refresh_disk_stack() {
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
+    udevadm control --reload 2>/dev/null || true
     udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
+    udevadm trigger --subsystem-match=scsi --action=change 2>/dev/null || true
+    udevadm settle -t 8 2>/dev/null || true
   fi
+  install_inquiry_preload
+  if [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]]; then
+    systemctl try-restart udisks2.service 2>/dev/null || true
+    # Disks caches Drive objects; closing it is required to see new names.
+    pkill -x gnome-disks 2>/dev/null || true
+  fi
+}
+
+install_inquiry_preload() {
+  local gccbin=""
+  mkdir -p "$(dirname "${INQUIRY_SO}")" "${STATE_DIR}"
+  cat >"${INQUIRY_SRC}" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdarg.h>
+#include <string.h>
+#include <scsi/sg.h>
+#include <sys/ioctl.h>
+
+static void patch_inquiry(void *buf, int len)
+{
+  unsigned char *b = buf;
+  if (!b || len < 36)
+    return;
+  if (memcmp(b + 8, "VMware", 6) != 0 &&
+      memcmp(b + 8, "NECVMW", 6) != 0 &&
+      memcmp(b + 16, "VMware", 6) != 0)
+    return;
+  if ((b[0] & 0x1f) == 0x05) {
+    memcpy(b + 8, "HL-DT-ST", 8);
+    memcpy(b + 16, "DVDRAM GUE0N    ", 16);
+    memcpy(b + 32, "1.00", 4);
+  } else {
+    memcpy(b + 8, "Samsung ", 8);
+    memcpy(b + 16, "SAMSUNG MZVL2512", 16);
+    memcpy(b + 32, "5L2Q", 4);
+  }
+}
+
+static int do_ioctl(int fd, unsigned long req, void *arg)
+{
+  static int (*real_ioctl)(int, unsigned long, ...);
+  int r;
+  if (!real_ioctl)
+    real_ioctl = (int (*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
+  r = real_ioctl(fd, req, arg);
+  if (r == 0 && req == SG_IO && arg) {
+    sg_io_hdr_t *h = arg;
+    unsigned char *cdb = h->cmdp;
+    if (cdb && cdb[0] == 0x12 && h->dxferp && h->dxfer_len >= 36)
+      patch_inquiry(h->dxferp, (int)h->dxfer_len);
+  }
+  return r;
+}
+
+int ioctl(int fd, unsigned long req, ...)
+{
+  va_list ap;
+  void *arg;
+  va_start(ap, req);
+  arg = va_arg(ap, void *);
+  va_end(ap);
+  return do_ioctl(fd, req, arg);
+}
+EOF
+  gccbin="$(command -v gcc || true)"
+  if [[ -n "${gccbin}" ]]; then
+    "${gccbin}" -shared -fPIC -O2 -o "${INQUIRY_SO}" "${INQUIRY_SRC}" -ldl 2>/dev/null || \
+      "${gccbin}" -shared -fPIC -O2 -o "${INQUIRY_SO}" "${INQUIRY_SRC}" 2>/dev/null || true
+  fi
+  if [[ -f "${INQUIRY_SO}" ]]; then
+    mkdir -p "$(dirname "${UDISKS_DROPIN}")"
+    cat >"${UDISKS_DROPIN}" <<EOF
+[Service]
+Environment=LD_PRELOAD=${INQUIRY_SO}
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+}
+
+remove_inquiry_preload() {
+  rm -f "${UDISKS_DROPIN}" "${INQUIRY_SO}" "${INQUIRY_SRC}"
+  rmdir "$(dirname "${UDISKS_DROPIN}")" 2>/dev/null || true
+  rmdir "$(dirname "${INQUIRY_SO}")" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  if [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]]; then
+    systemctl try-restart udisks2.service 2>/dev/null || true
+  fi
+}
+
+replace_stale_vmtools_procs() {
+  [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]] || return 0
+  # Leftover user-session vmtoolsd keeps comm=vmtoolsd until it is killed.
+  pkill -x vmtoolsd 2>/dev/null || true
+  sleep 0.4
+  pkill -9 -x vmtoolsd 2>/dev/null || true
+  systemctl try-restart vgauth.service open-vm-tools.service 2>/dev/null || true
+  command -v loginctl >/dev/null 2>&1 || return 0
+  local sess uid runtime stype display wayland p comm
+  while read -r sess _; do
+    [[ -z "${sess}" ]] && continue
+    stype="$(loginctl show-session "${sess}" -p Type --value 2>/dev/null || true)"
+    uid="$(loginctl show-session "${sess}" -p User --value 2>/dev/null || true)"
+    [[ "${stype}" == "wayland" || "${stype}" == "x11" ]] || continue
+    [[ -n "${uid}" && "${uid}" != "0" ]] || continue
+    runtime="/run/user/${uid}"
+    [[ -d "${runtime}" ]] || continue
+    display="$(loginctl show-session "${sess}" -p Display --value 2>/dev/null || true)"
+    wayland=""
+    for p in /proc/[0-9]*; do
+      comm="$(cat "${p}/comm" 2>/dev/null || true)"
+      [[ "${comm}" == "gnome-shell" ]] || continue
+      if grep -q "^Uid:[[:space:]]*${uid}[[:space:]]" "${p}/status" 2>/dev/null; then
+        wayland="$(tr '\0' '\n' <"${p}/environ" 2>/dev/null | awk -F= '/^WAYLAND_DISPLAY=/{print $2; exit}')"
+        if [[ -z "${display}" ]]; then
+          display="$(tr '\0' '\n' <"${p}/environ" 2>/dev/null | awk -F= '/^DISPLAY=/{print $2; exit}')"
+        fi
+        break
+      fi
+    done
+    local -a run_cmd
+    run_cmd=(systemd-run --quiet --collect "--uid=${uid}"
+      "--setenv=XDG_RUNTIME_DIR=${runtime}"
+      "--setenv=XDG_SESSION_TYPE=${stype}")
+    [[ -n "${display}" ]] && run_cmd+=("--setenv=DISPLAY=${display}")
+    [[ -n "${wayland}" ]] && run_cmd+=("--setenv=WAYLAND_DISPLAY=${wayland}")
+    run_cmd+=(/usr/bin/vmware-user-suid-wrapper)
+    "${run_cmd[@]}" >/dev/null 2>&1 || true
+  done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}')
 }
 
 unmount_block_identity() {
@@ -344,7 +496,8 @@ unmount_block_identity() {
       fi
     done
   done
-  rm -f "${UDEV_DISK_RULE}"
+  rm -f "${UDEV_DISK_RULE}" /etc/udev/rules.d/61-make-real-laptop-disk.rules
+  remove_inquiry_preload
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
     udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
@@ -558,7 +711,7 @@ EOF
   nautilus_hide /etc/xdg/autostart vmware-user.desktop
 
   if [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]]; then
-    systemctl try-restart vgauth.service open-vm-tools.service 2>/dev/null || true
+    replace_stale_vmtools_procs
   fi
 }
 
@@ -902,7 +1055,8 @@ cmd_install() {
   cmd_apply
   echo
   echo "installed. identity is applied and will re-apply at boot."
-  echo "Log out of GNOME (or reboot) so System Monitor drops the old vmtoolsd process."
+  echo "Log out of GNOME only if status still lists a vmtoolsd process."
+  echo "Close GNOME Disks and open it again to refresh the drive model."
   print_vmx_hint
   cmd_status
 }
@@ -1036,6 +1190,24 @@ cmd_status() {
         ;;
     esac
   done
+  echo
+  echo "=== Disks / UDisks2 (not lsblk) ==="
+  if [[ -e /dev/sda ]]; then
+    echo "sysfs model/vendor:"
+    printf '  vendor=%s model=%s rev=%s\n' \
+      "$(tr -d '\n' </sys/block/sda/device/vendor 2>/dev/null || echo n/a)" \
+      "$(tr -d '\n' </sys/block/sda/device/model 2>/dev/null || echo n/a)" \
+      "$(tr -d '\n' </sys/block/sda/device/rev 2>/dev/null || echo n/a)"
+    if command -v udevadm >/dev/null 2>&1; then
+      echo "udev:"
+      udevadm info -q property /dev/sda 2>/dev/null | grep -E '^(ID_VENDOR|ID_MODEL|ID_REVISION)=' || true
+    fi
+    if command -v udisksctl >/dev/null 2>&1; then
+      echo "udisksctl:"
+      udisksctl info -b /dev/sda 2>/dev/null | grep -E '^\s+(Model|Vendor|Revision):' || true
+    fi
+  fi
+  echo "(Close and reopen GNOME Disks if it still shows VMware — it caches drive names.)"
 }
 
 usage() {
