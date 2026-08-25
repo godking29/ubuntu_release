@@ -9,11 +9,11 @@
 #   DMI product_name     -> Latitude 5540  (real Dell model string)
 #   /proc/cpuinfo        -> same CPU, hypervisor flag stripped
 #
-# Usage (as root):
-#   sudo ./make-real-laptop.sh install    # apply now + persist across reboot
-#   sudo ./make-real-laptop.sh apply      # apply once (used by the systemd unit)
-#   sudo ./make-real-laptop.sh status     # show current vs spoofed values
-#   sudo ./make-real-laptop.sh revert     # undo everything
+# Usage (does not need chmod +x — run it with bash):
+#   sudo bash make-real-laptop.sh install    # apply now + persist across reboot
+#   sudo bash make-real-laptop.sh apply      # apply once (used by the systemd unit)
+#   sudo bash make-real-laptop.sh status     # show current vs spoofed values
+#   sudo bash make-real-laptop.sh revert     # undo everything
 #
 # Guest-side DMI/hostname/cpuinfo overlays always work.
 # systemd-detect-virt also uses the CPUID hypervisor bit, which only the
