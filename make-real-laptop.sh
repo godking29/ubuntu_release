@@ -276,7 +276,13 @@ EOF
 #!/bin/sh
 # Installed by make-real-laptop.sh — drop VMware CPUID rows lscpu prints.
 # A physical Intel laptop has no "Hypervisor vendor" / "Virtualization type".
-/usr/bin/lscpu.real "$@" | grep -v -E '^Hypervisor vendor:|^Virtualization type:'
+# Vulnerability rows that say "Dependent on hypervisor status" also leak VM.
+/usr/bin/lscpu.real "$@" \
+  | sed \
+      -e '/^Hypervisor vendor:/d' \
+      -e '/^Virtualization type:/d' \
+      -e 's/Unknown: Dependent on hypervisor status/Not affected/' \
+  | grep -vi hypervisor
 EOF
   chmod 755 "${LSCPU_BIN}"
 }
