@@ -16,12 +16,14 @@
 #   sudo bash make-real-laptop.sh revert     # undo everything
 #
 # Guest-side DMI/hostname/cpuinfo overlays always work.
-# systemd-detect-virt also uses the CPUID hypervisor bit, which only the
-# VMware *host* can clear. This script:
+# lscpu "Hypervisor vendor: VMware" comes from the CPUID instruction, which a
+# guest cannot change. This script:
 #   1. spoofs DMI so detect_vm_dmi() does not see VMware
 #   2. hides /sys/hypervisor
-#   3. installs a systemd-detect-virt wrapper so the command prints "none"
-#   4. prints the .vmx lines you must add on the host so lscpu/CPUID match
+#   3. wraps systemd-detect-virt so it prints "none"
+#   4. wraps lscpu so it does not print Hypervisor vendor / Virtualization type
+#   5. prints the .vmx lines you MUST add on the Windows VMware host so the
+#      CPUID bit itself is cleared (needed for cpuid, browsers, etc.)
 #
 set -euo pipefail
 
@@ -32,6 +34,8 @@ UNIT_PATH="/etc/systemd/system/make-real-laptop.service"
 INSTALL_PATH="/usr/local/sbin/make-real-laptop.sh"
 VIRT_BIN="/usr/bin/systemd-detect-virt"
 VIRT_REAL="/usr/bin/systemd-detect-virt.real"
+LSCPU_BIN="/usr/bin/lscpu"
+LSCPU_REAL="/usr/bin/lscpu.real"
 HOSTNAME_NEW="dell-laptop"
 
 # Real Latitude 5540 SMBIOS strings (public Dell laptop identity).
@@ -221,16 +225,33 @@ apply_hostname() {
   fi
 }
 
+ensure_divert() {
+  local orig="$1" real="$2"
+  [[ -e "${orig}" ]] || return 0
+  if [[ ! -e "${real}" ]]; then
+    if command -v dpkg-divert >/dev/null 2>&1; then
+      dpkg-divert --local --rename --divert "${real}" --add "${orig}" >/dev/null
+    else
+      cp -a "${orig}" "${real}"
+    fi
+  fi
+}
+
+remove_divert() {
+  local orig="$1" real="$2"
+  if [[ -e "${real}" ]]; then
+    rm -f "${orig}"
+    if command -v dpkg-divert >/dev/null 2>&1; then
+      dpkg-divert --local --rename --remove "${orig}" >/dev/null 2>&1 || mv -f "${real}" "${orig}"
+    else
+      mv -f "${real}" "${orig}"
+    fi
+  fi
+}
+
 install_virt_wrapper() {
-  [[ -x "${VIRT_BIN}" ]] || return 0
-  if [[ -x "${VIRT_REAL}" ]]; then
-    return 0
-  fi
-  if command -v dpkg-divert >/dev/null 2>&1; then
-    dpkg-divert --local --rename --divert "${VIRT_REAL}" --add "${VIRT_BIN}" >/dev/null
-  else
-    cp -a "${VIRT_BIN}" "${VIRT_REAL}"
-  fi
+  ensure_divert "${VIRT_BIN}" "${VIRT_REAL}"
+  [[ -e "${VIRT_REAL}" ]] || return 0
   cat >"${VIRT_BIN}" <<'EOF'
 #!/bin/sh
 # Installed by make-real-laptop.sh — a physical laptop reports no VM.
@@ -248,19 +269,21 @@ echo none
 exit 1
 EOF
   chmod 755 "${VIRT_BIN}"
+
+  ensure_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
+  [[ -e "${LSCPU_REAL}" ]] || return 0
+  cat >"${LSCPU_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh — drop VMware CPUID rows lscpu prints.
+# A physical Intel laptop has no "Hypervisor vendor" / "Virtualization type".
+/usr/bin/lscpu.real "$@" | grep -v -E '^Hypervisor vendor:|^Virtualization type:'
+EOF
+  chmod 755 "${LSCPU_BIN}"
 }
 
 remove_virt_wrapper() {
-  if [[ -x "${VIRT_REAL}" ]]; then
-    rm -f "${VIRT_BIN}"
-    if command -v dpkg-divert >/dev/null 2>&1; then
-      dpkg-divert --local --rename --remove "${VIRT_BIN}" >/dev/null 2>&1 || {
-        mv -f "${VIRT_REAL}" "${VIRT_BIN}"
-      }
-    else
-      mv -f "${VIRT_REAL}" "${VIRT_BIN}"
-    fi
-  fi
+  remove_divert "${VIRT_BIN}" "${VIRT_REAL}"
+  remove_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
 }
 
 write_unit() {
@@ -286,22 +309,39 @@ EOF
 print_vmx_hint() {
   cat <<'EOF'
 
---- VMware Workstation / ESXi (.vmx) — add these WHILE THE VM IS POWERED OFF ---
-These clear the CPUID hypervisor bit. Guest DMI spoofing cannot do that.
+=== Why lscpu still said VMware ===============================================
+DMI and /proc/cpuinfo are files. This script can overlay them.
+"Hypervisor vendor: VMware" is NOT a file. lscpu asks the CPU (CPUID leaf
+0x40000000). Only the VMware *host* can turn that bit off.
 
-  smbios.reflectHost = "FALSE"
-  SMBIOS.use12cdromType = "FALSE"
-  isolation.tools.getVersion.disable = "TRUE"
-  hypervisor.cpuid.v0 = "FALSE"
-  board-id.reflectHost = "FALSE"
-  hw.model.reflectHost = "FALSE"
-  serialNumber.reflectHost = "FALSE"
+Guest wrappers now hide it from `lscpu` and `systemd-detect-virt`.
+Other tools (the `cpuid` command, some browsers) still see VMware until
+you edit the .vmx on Windows.
 
-  smbios.useShortSerialNumber = "TRUE"
-  smbios.use12DeviceType = "TRUE"
+=== On the Windows host — do this exactly =====================================
+1. Inside Ubuntu:  sudo shutdown -h now
+   Wait until VMware shows Powered Off. Suspend / Restart is not enough.
 
-After editing, power on the VM (full power off, not suspend) and run:
-  sudo make-real-laptop.sh status
+2. VMware Workstation: right-click the VM -> Open VM Directory
+   (or look in Documents\Virtual Machines\<name>\<name>.vmx)
+
+3. Open the .vmx in Notepad. Add these lines at the BOTTOM, then Save:
+
+hypervisor.cpuid.v0 = "FALSE"
+vhv.enable = "FALSE"
+cpuid.1.ecx = "0---:----:----:----:----:----:----:----"
+cpuid.40000000.eax = "0000:0000:0000:0000:0000:0000:0000:0000"
+cpuid.40000000.ebx = "0000:0000:0000:0000:0000:0000:0000:0000"
+cpuid.40000000.ecx = "0000:0000:0000:0000:0000:0000:0000:0000"
+cpuid.40000000.edx = "0000:0000:0000:0000:0000:0000:0000:0000"
+isolation.tools.getVersion.disable = "TRUE"
+
+4. Power the VM on. Then in Ubuntu:
+
+   sudo bash make-real-laptop.sh apply
+   lscpu | grep -i hypervisor
+
+   A real laptop prints nothing for that grep.
 
 EOF
 }
@@ -391,9 +431,12 @@ cmd_status() {
     echo "=== lscpu virtualization ==="
     lscpu | grep -iE 'Hypervisor|Virtualization|Vendor ID|Model name' || true
     echo
-    echo "If 'Hypervisor vendor' still says VMware, add hypervisor.cpuid.v0 = FALSE"
-    echo "to the VMX on the host and power the VM fully off/on. The systemd-detect-virt"
-    echo "command is already forced to 'none' by the wrapper."
+    if lscpu | grep -q 'Hypervisor vendor:'; then
+      echo "lscpu still reports a hypervisor. Copy the updated script onto the VM and run:"
+      echo "  sudo bash make-real-laptop.sh install"
+      echo "That wraps lscpu. To clear the CPUID bit itself, edit the .vmx on Windows"
+      echo "(see the block printed during install)."
+    fi
   fi
 }
 
