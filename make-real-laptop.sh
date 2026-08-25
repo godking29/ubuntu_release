@@ -22,8 +22,9 @@
 #   2. hides /sys/hypervisor
 #   3. wraps systemd-detect-virt so it prints "none"
 #   4. wraps lscpu so it does not print Hypervisor vendor / Virtualization type
-#   5. prints the .vmx lines you MUST add on the Windows VMware host so the
-#      CPUID bit itself is cleared (needed for cpuid, browsers, etc.)
+#   5. wraps hostnamectl so Virtualization: vmware is omitted (bare metal
+#      hostnamectl has no Virtualization line). hostnamed still sees CPUID;
+#      do not mask CPUID in the .vmx (that breaks Chrome and VMware Tools).
 #
 set -euo pipefail
 
@@ -36,6 +37,9 @@ VIRT_BIN="/usr/bin/systemd-detect-virt"
 VIRT_REAL="/usr/bin/systemd-detect-virt.real"
 LSCPU_BIN="/usr/bin/lscpu"
 LSCPU_REAL="/usr/bin/lscpu.real"
+HOSTNAMECTL_BIN="/usr/bin/hostnamectl"
+HOSTNAMECTL_REAL="/usr/bin/hostnamectl.real"
+HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
 HOSTNAME_NEW="dell-laptop"
 
 # Real Latitude 5540 SMBIOS strings (public Dell laptop identity).
@@ -285,11 +289,46 @@ EOF
   | grep -vi hypervisor
 EOF
   chmod 755 "${LSCPU_BIN}"
+
+  # hostnamectl talks to systemd-hostnamed over D-Bus. That daemon calls
+  # detect_virtualization() in-process (CPUID), NOT /usr/bin/systemd-detect-virt.
+  # Wrapping the virt binary therefore cannot hide "Virtualization: vmware".
+  # A physical laptop omits that line; strip it from status output. Mutating
+  # subcommands (set-hostname, …) go straight to the real binary.
+  ensure_divert "${HOSTNAMECTL_BIN}" "${HOSTNAMECTL_REAL}"
+  [[ -e "${HOSTNAMECTL_REAL}" ]] || return 0
+  cat >"${HOSTNAMECTL_BIN}" <<'EOF'
+#!/bin/sh
+real=/usr/bin/hostnamectl.real
+for arg in "$@"; do
+  case "${arg}" in
+    set-hostname|set-chassis|set-deployment|set-location|set-icon-name|set-pretty)
+      exec "${real}" "$@"
+      ;;
+  esac
+done
+"${real}" "$@" | sed -e '/^[[:space:]]*Virtualization:/d'
+EOF
+  chmod 755 "${HOSTNAMECTL_BIN}"
+
+  mkdir -p "$(dirname "${HOSTNAMED_DROPIN}")"
+  cat >"${HOSTNAMED_DROPIN}" <<'EOF'
+[Service]
+# systemd 256+ honours this; 255 (Ubuntu 24.04) ignores it. Harmless either way.
+Environment=SYSTEMD_VIRTUALIZATION=none
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl try-restart systemd-hostnamed.service 2>/dev/null || true
 }
 
 remove_virt_wrapper() {
   remove_divert "${VIRT_BIN}" "${VIRT_REAL}"
   remove_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
+  remove_divert "${HOSTNAMECTL_BIN}" "${HOSTNAMECTL_REAL}"
+  rm -f "${HOSTNAMED_DROPIN}"
+  rmdir "$(dirname "${HOSTNAMED_DROPIN}")" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl try-restart systemd-hostnamed.service 2>/dev/null || true
 }
 
 write_unit() {
@@ -315,39 +354,33 @@ EOF
 print_vmx_hint() {
   cat <<'EOF'
 
-=== Why lscpu still said VMware ===============================================
-DMI and /proc/cpuinfo are files. This script can overlay them.
-"Hypervisor vendor: VMware" is NOT a file. lscpu asks the CPU (CPUID leaf
-0x40000000). Only the VMware *host* can turn that bit off.
+=== Host .vmx CPUID masks — do NOT use them ===================================
+Zeroing CPUID leaf 0x40000000 hides VMware from lscpu, but VMware Tools
+*needs* that leaf to talk to the hypervisor. Masking leaf 1 ECX can also
+strip AVX/OSXSAVE and Chrome then crashes with a "corrupted profile".
 
-Guest wrappers now hide it from `lscpu` and `systemd-detect-virt`.
-Other tools (the `cpuid` command, some browsers) still see VMware until
-you edit the .vmx on Windows.
+Do not add these (and remove them if you already did):
 
-=== On the Windows host — do this exactly =====================================
-1. Inside Ubuntu:  sudo shutdown -h now
-   Wait until VMware shows Powered Off. Suspend / Restart is not enough.
+  cpuid.1.ecx = ...
+  cpuid.40000000.eax / ebx / ecx / edx = ...
+  isolation.tools.getVersion.disable = "TRUE"
 
-2. VMware Workstation: right-click the VM -> Open VM Directory
-   (or look in Documents\Virtual Machines\<name>\<name>.vmx)
+Guest wrappers already hide VMware from systemd-detect-virt, lscpu, and hostnamectl.
+Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
 
-3. Open the .vmx in Notepad. Add these lines at the BOTTOM, then Save:
+If you already added those lines: shut the VM fully off, delete them from
+the .vmx, save, power on. Then:
 
-hypervisor.cpuid.v0 = "FALSE"
-vhv.enable = "FALSE"
-cpuid.1.ecx = "0---:----:----:----:----:----:----:----"
-cpuid.40000000.eax = "0000:0000:0000:0000:0000:0000:0000:0000"
-cpuid.40000000.ebx = "0000:0000:0000:0000:0000:0000:0000:0000"
-cpuid.40000000.ecx = "0000:0000:0000:0000:0000:0000:0000:0000"
-cpuid.40000000.edx = "0000:0000:0000:0000:0000:0000:0000:0000"
-isolation.tools.getVersion.disable = "TRUE"
+  sudo apt-get install --reinstall -y open-vm-tools open-vm-tools-desktop
+  sudo systemctl restart open-vm-tools
 
-4. Power the VM on. Then in Ubuntu:
+Chrome: if it still says the profile is corrupted after the CPUID is
+restored, it crashed while the mask was on. Test with:
 
-   sudo bash make-real-laptop.sh apply
-   lscpu | grep -i hypervisor
+  google-chrome --user-data-dir=/tmp/chrome-check
 
-   A real laptop prints nothing for that grep.
+If that window is fine, the browser is OK and only the old profile lock
+is stale — remove ~/.config/google-chrome/SingletonLock and retry.
 
 EOF
 }
@@ -433,16 +466,16 @@ cmd_status() {
     echo "hypervisor flag:       absent (as on a physical laptop)"
   fi
   echo
+  echo
+  echo "=== hostnamectl (Virtualization line must be absent) ==="
+  hostnamectl | grep -E 'hostname|Chassis|Virtualization|Hardware Vendor|Hardware Model' || true
+  if [[ -x "${HOSTNAMECTL_REAL}" ]] && "${HOSTNAMECTL_REAL}" | grep -q 'Virtualization:'; then
+    echo "(D-Bus hostnamed still reports a VM; hostnamectl no longer prints that line.)"
+  fi
   if command -v lscpu >/dev/null 2>&1; then
-    echo "=== lscpu virtualization ==="
-    lscpu | grep -iE 'Hypervisor|Virtualization|Vendor ID|Model name' || true
     echo
-    if lscpu | grep -q 'Hypervisor vendor:'; then
-      echo "lscpu still reports a hypervisor. Copy the updated script onto the VM and run:"
-      echo "  sudo bash make-real-laptop.sh install"
-      echo "That wraps lscpu. To clear the CPUID bit itself, edit the .vmx on Windows"
-      echo "(see the block printed during install)."
-    fi
+    echo "=== lscpu ==="
+    lscpu | grep -iE 'Vendor ID|Model name|Hypervisor|Virtualization type' || true
   fi
 }
 
