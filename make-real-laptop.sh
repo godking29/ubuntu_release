@@ -65,6 +65,7 @@ ETHTOOL_BIN_ALT="/usr/bin/ethtool"
 ETHTOOL_REAL_ALT="/usr/bin/ethtool.real"
 HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
 UDEV_DISK_RULE="/etc/udev/rules.d/99-make-real-laptop-disk.rules"
+DISK_ID_HELPER="/usr/libexec/make-real-laptop-disk-id"
 UDISKS_DROPIN="/etc/systemd/system/udisks2.service.d/make-real-laptop.conf"
 INQUIRY_SRC="${STATE_DIR}/fakeinquiry.c"
 INQUIRY_SO="/usr/lib/make-real-laptop/libfakeinquiry.so"
@@ -326,25 +327,54 @@ apply_block_identity() {
     bind_scsi_attrs "${dest}" "${kind}"
   done
   rm -f /etc/udev/rules.d/61-make-real-laptop-disk.rules
-  cat >"${UDEV_DISK_RULE}" <<'EOF'
+  write_disk_id_helper
+  cat >"${UDEV_DISK_RULE}" <<EOF
 # Installed by make-real-laptop.sh
-# Must run AFTER 60-persistent-storage.rules (scsi_id / ata_id) so Disks/UDisks2
-# do not keep the VMware INQUIRY strings. Do not touch ID_SERIAL / WWN.
-SUBSYSTEM=="block", KERNEL=="sd*[!0-9]", \
-  ENV{ID_VENDOR}="Samsung", \
-  ENV{ID_MODEL}="SAMSUNG MZVL2512", \
-  ENV{ID_REVISION}="5L2Q", \
-  ENV{ID_VENDOR_FROM_DATABASE}="Samsung Electronics", \
-  ENV{ID_MODEL_FROM_DATABASE}="SAMSUNG MZVL2512", \
-  ENV{ID_SCSI_VENDOR}="Samsung", \
-  ENV{ID_SCSI_MODEL}="SAMSUNG MZVL2512"
-# Modern Latitude has no optical drive; hide the VMware CD from GNOME Disks.
-SUBSYSTEM=="block", KERNEL=="sr*", ENV{UDISKS_IGNORE}="1"
-SUBSYSTEM=="scsi", ATTR{vendor}=="VMware*", \
-  ENV{ID_VENDOR}="Samsung", ENV{ID_MODEL}="SAMSUNG MZVL2512"
-SUBSYSTEM=="scsi", ATTR{vendor}=="NECVMW*", ENV{UDISKS_IGNORE}="1"
+# UDisks2 / GNOME Disks use ID_VENDOR_ENC and ID_MODEL_ENC, not ID_VENDOR.
+# 60-persistent-storage.rules (scsi_id) sets ENC to VMware INQUIRY strings.
+# IMPORT this helper afterwards so ENC is Samsung. Do not touch ID_SERIAL.
+SUBSYSTEM=="block", KERNEL=="sd*[!0-9]", IMPORT{program}="${DISK_ID_HELPER}"
+SUBSYSTEM=="block", KERNEL=="sr*", IMPORT{program}="${DISK_ID_HELPER}"
 EOF
   refresh_disk_stack
+}
+
+write_disk_id_helper() {
+  mkdir -p "$(dirname "${DISK_ID_HELPER}")"
+  cat >"${DISK_ID_HELPER}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh — udev IMPORT{program} reads stdout.
+k="${KERNEL:-}"
+[ -n "$k" ] || k=$(basename "${DEVNAME:-}")
+
+case "$k" in
+  sr*|scd*)
+    printf '%s\n' \
+      "ID_VENDOR=HL-DT-ST" \
+      "ID_VENDOR_ENC=HL-DT-ST" \
+      "ID_MODEL=DVDRAM GUE0N" \
+      "ID_MODEL_ENC=DVDRAM\\x20GUE0N" \
+      "ID_REVISION=1.00" \
+      "UDISKS_IGNORE=1" \
+      "UDISKS_AUTO=0" \
+      "UDISKS_PRESENTATION_HIDE=1"
+    ;;
+  *)
+    printf '%s\n' \
+      "ID_VENDOR=Samsung" \
+      "ID_VENDOR_ENC=Samsung" \
+      "ID_MODEL=SAMSUNG MZVL2512" \
+      "ID_MODEL_ENC=SAMSUNG\\x20MZVL2512" \
+      "ID_REVISION=5L2Q" \
+      "ID_SCSI_VENDOR=Samsung" \
+      "ID_SCSI_MODEL=SAMSUNG MZVL2512" \
+      "ID_VENDOR_FROM_DATABASE=Samsung Electronics" \
+      "ID_MODEL_FROM_DATABASE=SAMSUNG MZVL2512"
+    ;;
+esac
+exit 0
+EOF
+  chmod 755 "${DISK_ID_HELPER}"
 }
 
 refresh_disk_stack() {
@@ -353,13 +383,21 @@ refresh_disk_stack() {
     udevadm control --reload 2>/dev/null || true
     udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
     udevadm trigger --subsystem-match=scsi --action=change 2>/dev/null || true
+    local dev
+    for dev in /sys/class/block/sd* /sys/class/block/sr*; do
+      [[ -e "${dev}" ]] || continue
+      case "$(basename "${dev}")" in
+        sd*[0-9]) continue ;;
+      esac
+      udevadm trigger --action=change "${dev}" 2>/dev/null || true
+    done
     udevadm settle -t 8 2>/dev/null || true
   fi
   install_inquiry_preload
   if [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]]; then
-    systemctl try-restart udisks2.service 2>/dev/null || true
-    # Disks caches Drive objects; closing it is required to see new names.
+    systemctl restart udisks2.service 2>/dev/null || systemctl try-restart udisks2.service 2>/dev/null || true
     pkill -x gnome-disks 2>/dev/null || true
+    pkill -x org.gnome.DiskUtility 2>/dev/null || true
   fi
 }
 
@@ -496,7 +534,7 @@ unmount_block_identity() {
       fi
     done
   done
-  rm -f "${UDEV_DISK_RULE}" /etc/udev/rules.d/61-make-real-laptop-disk.rules
+  rm -f "${UDEV_DISK_RULE}" /etc/udev/rules.d/61-make-real-laptop-disk.rules "${DISK_ID_HELPER}"
   remove_inquiry_preload
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
@@ -1200,7 +1238,7 @@ cmd_status() {
       "$(tr -d '\n' </sys/block/sda/device/rev 2>/dev/null || echo n/a)"
     if command -v udevadm >/dev/null 2>&1; then
       echo "udev:"
-      udevadm info -q property /dev/sda 2>/dev/null | grep -E '^(ID_VENDOR|ID_MODEL|ID_REVISION)=' || true
+      udevadm info -q property /dev/sda 2>/dev/null | grep -E '^(ID_VENDOR|ID_VENDOR_ENC|ID_MODEL|ID_MODEL_ENC|ID_REVISION)=' || true
     fi
     if command -v udisksctl >/dev/null 2>&1; then
       echo "udisksctl:"
