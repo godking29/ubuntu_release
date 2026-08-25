@@ -28,6 +28,12 @@
 #   6. wraps lspci so vendor 15ad / "VMware" device names are rewritten to
 #      Intel. The real PCI IDs in sysfs are unchanged (changing them would
 #      break GPU, disk, USB, and VMware Tools).
+#   7. spoofs SCSI model/vendor in sysfs + wraps lsblk (VMware Virtual disk /
+#      NECVMWar CD). Does not change WWN / by-id (that would break fstab).
+#   8. wraps ps so vmtoolsd is not listed. The daemon stays running — do not
+#      stop open-vm-tools (clipboard, display, Tools would break). pgrep is
+#      left alone so Tools can still find itself.
+#   9. wraps ethtool so vmxnet3 is printed as e1000e.
 #
 set -euo pipefail
 
@@ -44,8 +50,27 @@ HOSTNAMECTL_BIN="/usr/bin/hostnamectl"
 HOSTNAMECTL_REAL="/usr/bin/hostnamectl.real"
 LSPCI_BIN="/usr/bin/lspci"
 LSPCI_REAL="/usr/bin/lspci.real"
+PS_BIN="/usr/bin/ps"
+PS_REAL="/usr/bin/ps.real"
+LSBLK_BIN="/usr/bin/lsblk"
+LSBLK_REAL="/usr/bin/lsblk.real"
+LSSCSI_BIN="/usr/bin/lsscsi"
+LSSCSI_REAL="/usr/bin/lsscsi.real"
+ETHTOOL_BIN="/usr/sbin/ethtool"
+ETHTOOL_REAL="/usr/sbin/ethtool.real"
+ETHTOOL_BIN_ALT="/usr/bin/ethtool"
+ETHTOOL_REAL_ALT="/usr/bin/ethtool.real"
 HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
+UDEV_DISK_RULE="/etc/udev/rules.d/61-make-real-laptop-disk.rules"
 HOSTNAME_NEW="dell-laptop"
+
+# SCSI INQUIRY widths: vendor 8, product 16, revision 4. Latitude 5540 NVMe.
+BLOCK_DISK_VENDOR="ATA"
+BLOCK_DISK_MODEL="SAMSUNG MZVL2512"
+BLOCK_DISK_REV="5L2Q"
+BLOCK_CD_VENDOR="HL-DT-ST"
+BLOCK_CD_MODEL="DVDRAM GUE0N"
+BLOCK_CD_REV="1.00"
 
 # Real Latitude 5540 SMBIOS strings (public Dell laptop identity).
 DMI_SYS_VENDOR="Dell Inc."
@@ -215,6 +240,101 @@ hide_sys_hypervisor() {
   fi
 }
 
+scsi_pad() {
+  printf '%-*s\n' "$1" "$2"
+}
+
+bind_scsi_attrs() {
+  local dest="$1" kind="$2"
+  local name dir key vendor model rev
+  [[ -d "${dest}" ]] || return 0
+  name="$(basename "$(dirname "${dest}")")"
+  [[ -n "${name}" ]] || return 0
+  dir="${RUNTIME_DIR}/block/${name}"
+  mkdir -p "${dir}"
+  if [[ "${kind}" == "cd" ]]; then
+    vendor="$(scsi_pad 8 "${BLOCK_CD_VENDOR}")"
+    model="$(scsi_pad 16 "${BLOCK_CD_MODEL}")"
+    rev="$(scsi_pad 4 "${BLOCK_CD_REV}")"
+  else
+    vendor="$(scsi_pad 8 "${BLOCK_DISK_VENDOR}")"
+    model="$(scsi_pad 16 "${BLOCK_DISK_MODEL}")"
+    rev="$(scsi_pad 4 "${BLOCK_DISK_REV}")"
+  fi
+  printf '%s' "${vendor}" >"${dir}/vendor"
+  printf '%s' "${model}" >"${dir}/model"
+  printf '%s' "${rev}" >"${dir}/rev"
+  chmod 444 "${dir}/vendor" "${dir}/model" "${dir}/rev"
+  for key in vendor model rev; do
+    [[ -e "${dest}/${key}" ]] || continue
+    bind_file "${dir}/${key}" "${dest}/${key}"
+  done
+}
+
+scsi_kind_from_dir() {
+  local dest="$1" typef="" t="" name=""
+  name="$(basename "$(dirname "${dest}")")"
+  case "${name}" in
+    sr*|scd*) echo cd; return ;;
+  esac
+  typef="${dest}/type"
+  if [[ -r "${typef}" ]]; then
+    t="$(tr -d '[:space:]' <"${typef}" 2>/dev/null || true)"
+    # SCSI type 5 = CD/DVD
+    if [[ "${t}" == "5" ]]; then
+      echo cd
+      return
+    fi
+  fi
+  echo disk
+}
+
+apply_block_identity() {
+  local dest kind
+  mkdir -p "${RUNTIME_DIR}/block"
+  for dest in /sys/block/*/device; do
+    [[ -d "${dest}" ]] || continue
+    case "$(basename "$(dirname "${dest}")")" in
+      loop*|ram*|zram*|dm-*|md*|fd*) continue ;;
+    esac
+    kind="$(scsi_kind_from_dir "${dest}")"
+    bind_scsi_attrs "${dest}" "${kind}"
+  done
+  for dest in /sys/class/scsi_device/*/device /sys/class/scsi_disk/*/device /sys/class/scsi_generic/*/device; do
+    [[ -d "${dest}" ]] || continue
+    kind="$(scsi_kind_from_dir "${dest}")"
+    bind_scsi_attrs "${dest}" "${kind}"
+  done
+  cat >"${UDEV_DISK_RULE}" <<'EOF'
+# Installed by make-real-laptop.sh — display names only. Do not touch ID_SERIAL
+# or WWN; Ubuntu may mount by /dev/disk/by-id.
+SUBSYSTEM=="block", ENV{ID_VENDOR}=="VMware*", ENV{ID_VENDOR}="ATA", ENV{ID_MODEL}="SAMSUNG MZVL2512"
+SUBSYSTEM=="block", ENV{ID_VENDOR}=="NECVMWar*", ENV{ID_VENDOR}="HL-DT-ST", ENV{ID_MODEL}="DVDRAM GUE0N"
+SUBSYSTEM=="block", ENV{ID_MODEL}=="VMware*", ENV{ID_VENDOR}="ATA", ENV{ID_MODEL}="SAMSUNG MZVL2512"
+EOF
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
+  fi
+}
+
+unmount_block_identity() {
+  local dest key
+  for dest in /sys/block/*/device /sys/class/scsi_device/*/device /sys/class/scsi_disk/*/device /sys/class/scsi_generic/*/device; do
+    [[ -d "${dest}" ]] || continue
+    for key in vendor model rev; do
+      if findmnt -n "${dest}/${key}" >/dev/null 2>&1; then
+        umount "${dest}/${key}" 2>/dev/null || umount -l "${dest}/${key}" 2>/dev/null || true
+      fi
+    done
+  done
+  rm -f "${UDEV_DISK_RULE}"
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
+  fi
+}
+
 apply_hostname() {
   mkdir -p "${STATE_DIR}"
   if [[ ! -f "${STATE_DIR}/old-hostname" ]]; then
@@ -350,6 +470,82 @@ EOF
   chmod 755 "${LSPCI_BIN}"
   fi
 
+  # vmtoolsd must keep running (Tools / clipboard / display). Only hide it from
+  # `ps` listings. Do not wrap pgrep/pidof — open-vm-tools uses those.
+  ensure_divert "${PS_BIN}" "${PS_REAL}"
+  if [[ -e "${PS_REAL}" ]]; then
+  cat >"${PS_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/bin/ps.real "$@" | grep -viE 'vmtoolsd|vmware-user|vmware-vmblock|VGAuthService|vmware-rpctool|vmware-toolbox|open-vm-tools|VBoxService|VBoxClient|qemu-ga|spice-vdagent|xe-daemon' || true
+EOF
+  chmod 755 "${PS_BIN}"
+  fi
+
+  ensure_divert "${LSBLK_BIN}" "${LSBLK_REAL}"
+  if [[ -e "${LSBLK_REAL}" ]]; then
+  cat >"${LSBLK_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/bin/lsblk.real "$@" | sed \
+  -e 's/VMware Virtual SATA CDRW Drive/HL-DT-ST DVDRAM GUE0N/g' \
+  -e 's/VMware Virtual S[^[:space:]]*/SAMSUNG MZVL2512/g' \
+  -e 's/NECVMWar/HL-DT-ST/g' \
+  -e 's/[[:space:]]VMware[[:space:]]/ ATA /g' \
+  -e 's/\bVMware\b/ATA/g' \
+  -e 's/[[:space:]]spi[[:space:]]/ sata /g' \
+  | grep -viE 'vmware|necvmwar|pvscsi' || true
+EOF
+  chmod 755 "${LSBLK_BIN}"
+  fi
+
+  ensure_divert "${LSSCSI_BIN}" "${LSSCSI_REAL}"
+  if [[ -e "${LSSCSI_REAL}" ]]; then
+  cat >"${LSSCSI_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/bin/lsscsi.real "$@" | sed \
+  -e 's/VMware   Virtual S[^[:space:]]*/ATA      SAMSUNG MZVL2512/g' \
+  -e 's/NECVMWar VMware IDE CDR10/HL-DT-ST DVDRAM GUE0N  /g' \
+  -e 's/VMware Virtual SATA CDRW Drive/HL-DT-ST DVDRAM GUE0N/g' \
+  -e 's/VMware/ATA   /g' \
+  -e 's/NECVMWar/HL-DT-ST/g' \
+  | grep -viE 'vmware|necvmwar' || true
+EOF
+  chmod 755 "${LSSCSI_BIN}"
+  fi
+
+  ensure_divert "${ETHTOOL_BIN}" "${ETHTOOL_REAL}"
+  if [[ -e "${ETHTOOL_REAL}" ]]; then
+  cat >"${ETHTOOL_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/sbin/ethtool.real "$@" | sed \
+  -e 's/vmxnet3/e1000e/g' \
+  -e 's/vmxnet/e1000e/g' \
+  -e 's/VMware/Intel/g' \
+  | grep -viE 'vmware|vmxnet|vmw_' || true
+EOF
+  chmod 755 "${ETHTOOL_BIN}"
+  fi
+  if [[ -e "${ETHTOOL_BIN_ALT}" && "${ETHTOOL_BIN_ALT}" != "${ETHTOOL_BIN}" ]]; then
+    ensure_divert "${ETHTOOL_BIN_ALT}" "${ETHTOOL_REAL_ALT}"
+    if [[ -e "${ETHTOOL_REAL_ALT}" ]]; then
+    cat >"${ETHTOOL_BIN_ALT}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+real=/usr/bin/ethtool.real
+[ -x "${real}" ] || real=/usr/sbin/ethtool.real
+"${real}" "$@" | sed \
+  -e 's/vmxnet3/e1000e/g' \
+  -e 's/vmxnet/e1000e/g' \
+  -e 's/VMware/Intel/g' \
+  | grep -viE 'vmware|vmxnet|vmw_' || true
+EOF
+    chmod 755 "${ETHTOOL_BIN_ALT}"
+    fi
+  fi
+
   mkdir -p "$(dirname "${HOSTNAMED_DROPIN}")"
   cat >"${HOSTNAMED_DROPIN}" <<'EOF'
 [Service]
@@ -365,6 +561,11 @@ remove_virt_wrapper() {
   remove_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
   remove_divert "${HOSTNAMECTL_BIN}" "${HOSTNAMECTL_REAL}"
   remove_divert "${LSPCI_BIN}" "${LSPCI_REAL}"
+  remove_divert "${PS_BIN}" "${PS_REAL}"
+  remove_divert "${LSBLK_BIN}" "${LSBLK_REAL}"
+  remove_divert "${LSSCSI_BIN}" "${LSSCSI_REAL}"
+  remove_divert "${ETHTOOL_BIN}" "${ETHTOOL_REAL}"
+  remove_divert "${ETHTOOL_BIN_ALT}" "${ETHTOOL_REAL_ALT}"
   rm -f "${HOSTNAMED_DROPIN}"
   rmdir "$(dirname "${HOSTNAMED_DROPIN}")" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
@@ -405,7 +606,7 @@ Do not add these (and remove them if you already did):
   cpuid.40000000.eax / ebx / ecx / edx = ...
   isolation.tools.getVersion.disable = "TRUE"
 
-Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, and lspci.
+Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, lspci, ps, lsblk, and ethtool.
 Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
 
 If you already added those lines: shut the VM fully off, delete them from
@@ -431,6 +632,7 @@ cmd_apply() {
   apply_dmi
   apply_cpuinfo
   hide_sys_hypervisor
+  apply_block_identity
   apply_hostname
   install_virt_wrapper
 }
@@ -463,6 +665,7 @@ cmd_revert() {
     done
   done
   findmnt -n /proc/cpuinfo >/dev/null 2>&1 && umount /proc/cpuinfo 2>/dev/null || true
+  unmount_block_identity
   if [[ -d /sys/hypervisor ]] && findmnt -n /sys/hypervisor >/dev/null 2>&1; then
     [[ "$(findmnt -n -o FSTYPE /sys/hypervisor 2>/dev/null || true)" == "tmpfs" ]] \
       && umount /sys/hypervisor 2>/dev/null || true
@@ -526,6 +729,39 @@ cmd_status() {
       echo "(none — lspci output uses Intel names; sysfs PCI IDs are still 15ad)"
     fi
   fi
+  echo
+  echo "=== ps (vmtoolsd / guest agents must be absent) ==="
+  if ps aux | grep -Ei 'vmtoolsd|VBoxService|qemu-ga|spice-vdagent|xe-daemon'; then
+    echo "NOTE: guest-tools process still visible — re-run: sudo bash $0 install"
+  else
+    echo "(none — vmtoolsd is still running; ps no longer lists it)"
+  fi
+  if command -v lsblk >/dev/null 2>&1; then
+    echo
+    echo "=== lsblk (VMware / NECVMWar must be absent) ==="
+    lsblk -o NAME,MODEL,VENDOR,TRAN,SIZE,TYPE
+    if lsblk -o NAME,MODEL,VENDOR | grep -Ei 'vmware|necvmwar'; then
+      echo "NOTE: lsblk still names VMware disks — re-run: sudo bash $0 install"
+    fi
+  fi
+  echo
+  echo "=== NIC (ethtool driver; VMware MAC OUI is still real) ==="
+  local iface driver mac
+  for iface in /sys/class/net/*; do
+    iface="$(basename "${iface}")"
+    [[ "${iface}" == "lo" ]] && continue
+    mac="$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo n/a)"
+    driver="n/a"
+    if command -v ethtool >/dev/null 2>&1; then
+      driver="$(ethtool -i "${iface}" 2>/dev/null | awk -F': ' '/^driver:/{print $2; exit}')"
+    fi
+    printf '%-10s driver=%-10s mac=%s\n' "${iface}" "${driver:-n/a}" "${mac}"
+    case "${mac}" in
+      00:0c:29:*|00:50:56:*|00:05:69:*|00:1c:14:*)
+        echo "  (MAC uses a VMware OUI. Changing it in-guest can break networking; set ethernet0.address in the .vmx if you need a Dell/Intel OUI.)"
+        ;;
+    esac
+  done
 }
 
 usage() {
@@ -533,7 +769,7 @@ usage() {
 Usage: sudo $0 <install|apply|status|revert>
 
   install   copy to /usr/local/sbin, enable boot service, apply now
-  apply     spoof DMI / cpuinfo / hostname / virt wrappers (once)
+  apply     spoof DMI / cpuinfo / disks / hostname / virt wrappers (once)
   status    print current identity
   revert    undo overlays, wrapper, hostname, and boot service
 EOF
