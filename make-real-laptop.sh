@@ -25,6 +25,9 @@
 #   5. wraps hostnamectl so Virtualization: vmware is omitted (bare metal
 #      hostnamectl has no Virtualization line). hostnamed still sees CPUID;
 #      do not mask CPUID in the .vmx (that breaks Chrome and VMware Tools).
+#   6. wraps lspci so vendor 15ad / "VMware" device names are rewritten to
+#      Intel. The real PCI IDs in sysfs are unchanged (changing them would
+#      break GPU, disk, USB, and VMware Tools).
 #
 set -euo pipefail
 
@@ -39,6 +42,8 @@ LSCPU_BIN="/usr/bin/lscpu"
 LSCPU_REAL="/usr/bin/lscpu.real"
 HOSTNAMECTL_BIN="/usr/bin/hostnamectl"
 HOSTNAMECTL_REAL="/usr/bin/hostnamectl.real"
+LSPCI_BIN="/usr/bin/lspci"
+LSPCI_REAL="/usr/bin/lspci.real"
 HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
 HOSTNAME_NEW="dell-laptop"
 
@@ -255,7 +260,7 @@ remove_divert() {
 
 install_virt_wrapper() {
   ensure_divert "${VIRT_BIN}" "${VIRT_REAL}"
-  [[ -e "${VIRT_REAL}" ]] || return 0
+  if [[ -e "${VIRT_REAL}" ]]; then
   cat >"${VIRT_BIN}" <<'EOF'
 #!/bin/sh
 # Installed by make-real-laptop.sh — a physical laptop reports no VM.
@@ -273,9 +278,10 @@ echo none
 exit 1
 EOF
   chmod 755 "${VIRT_BIN}"
+  fi
 
   ensure_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
-  [[ -e "${LSCPU_REAL}" ]] || return 0
+  if [[ -e "${LSCPU_REAL}" ]]; then
   cat >"${LSCPU_BIN}" <<'EOF'
 #!/bin/sh
 # Installed by make-real-laptop.sh — drop VMware CPUID rows lscpu prints.
@@ -289,6 +295,7 @@ EOF
   | grep -vi hypervisor
 EOF
   chmod 755 "${LSCPU_BIN}"
+  fi
 
   # hostnamectl talks to systemd-hostnamed over D-Bus. That daemon calls
   # detect_virtualization() in-process (CPUID), NOT /usr/bin/systemd-detect-virt.
@@ -296,7 +303,7 @@ EOF
   # A physical laptop omits that line; strip it from status output. Mutating
   # subcommands (set-hostname, …) go straight to the real binary.
   ensure_divert "${HOSTNAMECTL_BIN}" "${HOSTNAMECTL_REAL}"
-  [[ -e "${HOSTNAMECTL_REAL}" ]] || return 0
+  if [[ -e "${HOSTNAMECTL_REAL}" ]]; then
   cat >"${HOSTNAMECTL_BIN}" <<'EOF'
 #!/bin/sh
 real=/usr/bin/hostnamectl.real
@@ -310,6 +317,38 @@ done
 "${real}" "$@" | sed -e '/^[[:space:]]*Virtualization:/d'
 EOF
   chmod 755 "${HOSTNAMECTL_BIN}"
+  fi
+
+  # lspci reads the real PCI bus. VMware virtual devices are vendor 15ad.
+  # Changing those IDs in hardware would break SVGA, disk, USB and Tools.
+  # Rewrite lspci *output* to Intel Comet Lake / UHD 630 names (matches the
+  # i7-10700 already visible in cpuinfo). Numeric 15ad -> 8086.
+  ensure_divert "${LSPCI_BIN}" "${LSPCI_REAL}"
+  if [[ -e "${LSPCI_REAL}" ]]; then
+  cat >"${LSPCI_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/bin/lspci.real "$@" | sed \
+  -e '/15ad:0740/d' \
+  -e '/Virtual Machine Communication Interface/d' \
+  -e 's/VMware SVGA II Adapter/UHD Graphics 630/g' \
+  -e 's/VMware PCI Express Root Port/PCI Express Root Port/g' \
+  -e 's/VMware PCI bridge/PCI bridge/g' \
+  -e 's/VMware USB1\.1 UHCI Controller/USB UHCI Controller/g' \
+  -e 's/VMware USB2 EHCI Controller/USB EHCI Controller/g' \
+  -e 's/VMware SATA AHCI controller/SATA AHCI Controller/g' \
+  -e 's/VMware, Inc\./Intel Corporation/g' \
+  -e 's/VMware /Intel /g' \
+  -e 's/vmwgfx/i915/g' \
+  -e 's/vmw_pvscsi/ahci/g' \
+  -e 's/vmxnet3/e1000e/g' \
+  -e 's/\[15ad:/[8086:/g' \
+  -e 's/\b15ad:/8086:/g' \
+  | grep -viE 'vmware|15ad|virtualbox|virtio|qemu|xen|hyper-v|vmwgfx|vmw_|vmxnet' \
+  || true
+EOF
+  chmod 755 "${LSPCI_BIN}"
+  fi
 
   mkdir -p "$(dirname "${HOSTNAMED_DROPIN}")"
   cat >"${HOSTNAMED_DROPIN}" <<'EOF'
@@ -325,6 +364,7 @@ remove_virt_wrapper() {
   remove_divert "${VIRT_BIN}" "${VIRT_REAL}"
   remove_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
   remove_divert "${HOSTNAMECTL_BIN}" "${HOSTNAMECTL_REAL}"
+  remove_divert "${LSPCI_BIN}" "${LSPCI_REAL}"
   rm -f "${HOSTNAMED_DROPIN}"
   rmdir "$(dirname "${HOSTNAMED_DROPIN}")" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
@@ -365,7 +405,7 @@ Do not add these (and remove them if you already did):
   cpuid.40000000.eax / ebx / ecx / edx = ...
   isolation.tools.getVersion.disable = "TRUE"
 
-Guest wrappers already hide VMware from systemd-detect-virt, lscpu, and hostnamectl.
+Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, and lspci.
 Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
 
 If you already added those lines: shut the VM fully off, delete them from
@@ -477,6 +517,15 @@ cmd_status() {
     echo "=== lscpu ==="
     lscpu | grep -iE 'Vendor ID|Model name|Hypervisor|Virtualization type' || true
   fi
+  if command -v lspci >/dev/null 2>&1; then
+    echo
+    echo "=== lspci (VMware / 15ad must be absent) ==="
+    if lspci -nn | grep -Ei 'vmware|15ad|virtualbox|virtio|qemu|xen|hyper-v'; then
+      echo "NOTE: lspci still names VMware devices — re-run: sudo bash $0 install"
+    else
+      echo "(none — lspci output uses Intel names; sysfs PCI IDs are still 15ad)"
+    fi
+  fi
 }
 
 usage() {
@@ -484,7 +533,7 @@ usage() {
 Usage: sudo $0 <install|apply|status|revert>
 
   install   copy to /usr/local/sbin, enable boot service, apply now
-  apply     spoof DMI / cpuinfo / hostname / systemd-detect-virt (once)
+  apply     spoof DMI / cpuinfo / hostname / virt wrappers (once)
   status    print current identity
   revert    undo overlays, wrapper, hostname, and boot service
 EOF
