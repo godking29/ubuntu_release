@@ -28,6 +28,8 @@
 #   6. wraps lspci so vendor 15ad / "VMware" device names are rewritten to
 #      Intel. The real PCI IDs in sysfs are unchanged (changing them would
 #      break GPU, disk, USB, and VMware Tools).
+#   6b. wraps lsusb so vendor 0e0f (VMware Virtual Mouse / USB Hub) is
+#      rewritten to Logitech / Intel. Real USB IDs stay 0e0f.
 #   7. spoofs SCSI model/vendor in sysfs + udev (so GNOME Disks / UDisks2
 #      show Samsung, not VMware). lsblk is also wrapped. Optical drive is
 #      hidden from Disks (UDISKS_IGNORE).
@@ -53,6 +55,10 @@ HOSTNAMECTL_BIN="/usr/bin/hostnamectl"
 HOSTNAMECTL_REAL="/usr/bin/hostnamectl.real"
 LSPCI_BIN="/usr/bin/lspci"
 LSPCI_REAL="/usr/bin/lspci.real"
+LSUSB_BIN="/usr/bin/lsusb"
+LSUSB_REAL="/usr/bin/lsusb.real"
+USBDEVICES_BIN="/usr/bin/usb-devices"
+USBDEVICES_REAL="/usr/bin/usb-devices.real"
 PS_BIN="/usr/bin/ps"
 PS_REAL="/usr/bin/ps.real"
 LSBLK_BIN="/usr/bin/lsblk"
@@ -65,6 +71,7 @@ ETHTOOL_BIN_ALT="/usr/bin/ethtool"
 ETHTOOL_REAL_ALT="/usr/bin/ethtool.real"
 HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
 UDEV_DISK_RULE="/etc/udev/rules.d/99-make-real-laptop-disk.rules"
+UDEV_USB_RULE="/etc/udev/rules.d/99-make-real-laptop-usb.rules"
 DISK_ID_HELPER="/usr/libexec/make-real-laptop-disk-id"
 UDISKS_DROPIN="/etc/systemd/system/udisks2.service.d/make-real-laptop.conf"
 INQUIRY_SRC="${STATE_DIR}/fakeinquiry.c"
@@ -542,6 +549,78 @@ unmount_block_identity() {
   fi
 }
 
+usb_spoof_for_pid() {
+  local pid="$1"
+  case "${pid}" in
+    0003|0001)
+      printf '%s\n' "Logitech, Inc." "M105 Optical Mouse"
+      ;;
+    0002)
+      printf '%s\n' "Intel Corp." "Integrated Rate Matching Hub"
+      ;;
+    *)
+      printf '%s\n' "Intel Corp." "USB Composite Device"
+      ;;
+  esac
+}
+
+apply_usb_identity() {
+  local d vid pid name dir mfr prod
+  mkdir -p "${RUNTIME_DIR}/usb"
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f "${d}/idVendor" ]] || continue
+    vid="$(tr -d '[:space:]' <"${d}/idVendor" 2>/dev/null || true)"
+    [[ "${vid}" == "0e0f" ]] || continue
+    pid="$(tr -d '[:space:]' <"${d}/idProduct" 2>/dev/null || true)"
+    name="$(basename "${d}")"
+    dir="${RUNTIME_DIR}/usb/${name}"
+    mkdir -p "${dir}"
+    {
+      read -r mfr
+      read -r prod
+    } < <(usb_spoof_for_pid "${pid}")
+    printf '%s\n' "${mfr}" >"${dir}/manufacturer"
+    printf '%s\n' "${prod}" >"${dir}/product"
+    chmod 444 "${dir}/manufacturer" "${dir}/product"
+    [[ -e "${d}/manufacturer" ]] && bind_file "${dir}/manufacturer" "${d}/manufacturer"
+    [[ -e "${d}/product" ]] && bind_file "${dir}/product" "${d}/product"
+  done
+  cat >"${UDEV_USB_RULE}" <<'EOF'
+# Installed by make-real-laptop.sh — display names only. Real idVendor stays 0e0f.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", ATTR{idProduct}=="0003", \
+  ENV{ID_VENDOR}="Logitech, Inc.", ENV{ID_MODEL}="M105 Optical Mouse", \
+  ENV{ID_VENDOR_FROM_DATABASE}="Logitech, Inc.", ENV{ID_MODEL_FROM_DATABASE}="M105 Optical Mouse"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", ATTR{idProduct}=="0001", \
+  ENV{ID_VENDOR}="Logitech, Inc.", ENV{ID_MODEL}="M105 Optical Mouse", \
+  ENV{ID_VENDOR_FROM_DATABASE}="Logitech, Inc.", ENV{ID_MODEL_FROM_DATABASE}="M105 Optical Mouse"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", ATTR{idProduct}=="0002", \
+  ENV{ID_VENDOR}="Intel Corp.", ENV{ID_MODEL}="Integrated Rate Matching Hub", \
+  ENV{ID_VENDOR_FROM_DATABASE}="Intel Corp.", ENV{ID_MODEL_FROM_DATABASE}="Integrated Rate Matching Hub"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", \
+  ENV{ID_VENDOR}="Intel Corp.", ENV{ID_VENDOR_FROM_DATABASE}="Intel Corp."
+EOF
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
+  fi
+}
+
+unmount_usb_identity() {
+  local d key
+  for d in /sys/bus/usb/devices/*; do
+    for key in manufacturer product; do
+      if findmnt -n "${d}/${key}" >/dev/null 2>&1; then
+        umount "${d}/${key}" 2>/dev/null || umount -l "${d}/${key}" 2>/dev/null || true
+      fi
+    done
+  done
+  rm -f "${UDEV_USB_RULE}"
+  if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
+  fi
+}
+
 is_elf() {
   [[ -f "$1" ]] || return 1
   [[ "$(head -c 4 "$1" 2>/dev/null || true)" == $'\x7fELF' ]]
@@ -909,6 +988,52 @@ EOF
   chmod 755 "${LSPCI_BIN}"
   fi
 
+  # lsusb looks up 0e0f in usb.ids ("VMware, Inc."). Changing those USB IDs
+  # in hardware would break the virtual mouse/hub. Rewrite output only.
+  ensure_divert "${LSUSB_BIN}" "${LSUSB_REAL}"
+  if [[ -e "${LSUSB_REAL}" ]]; then
+  cat >"${LSUSB_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/bin/lsusb.real "$@" | sed \
+  -e 's/ID 0e0f:0003 VMware, Inc\. Virtual Mouse/ID 046d:c077 Logitech, Inc. M105 Optical Mouse/g' \
+  -e 's/ID 0e0f:0001 VMware, Inc\. .*/ID 046d:c077 Logitech, Inc. M105 Optical Mouse/g' \
+  -e 's/ID 0e0f:0002 VMware, Inc\. Virtual USB Hub/ID 8087:0024 Intel Corp. Integrated Rate Matching Hub/g' \
+  -e 's/0e0f:0003/046d:c077/g' \
+  -e 's/0e0f:0001/046d:c077/g' \
+  -e 's/0e0f:0002/8087:0024/g' \
+  -e 's/idVendor[[:space:]]*0x0e0f/idVendor           0x046d/g' \
+  -e 's/idProduct[[:space:]]*0x0003/idProduct          0xc077/g' \
+  -e 's/idProduct[[:space:]]*0x0002/idProduct          0x0024/g' \
+  -e 's/VMware, Inc\./Logitech, Inc./g' \
+  -e 's/VMware Virtual Mouse/M105 Optical Mouse/g' \
+  -e 's/VMware Virtual USB Mouse/M105 Optical Mouse/g' \
+  -e 's/Virtual Mouse/M105 Optical Mouse/g' \
+  -e 's/VMware Virtual USB Hub/Integrated Rate Matching Hub/g' \
+  -e 's/Virtual USB Hub/Integrated Rate Matching Hub/g' \
+  | grep -viE 'vmware|0e0f' || true
+EOF
+  chmod 755 "${LSUSB_BIN}"
+  fi
+
+  ensure_divert "${USBDEVICES_BIN}" "${USBDEVICES_REAL}"
+  if [[ -e "${USBDEVICES_REAL}" ]]; then
+  cat >"${USBDEVICES_BIN}" <<'EOF'
+#!/bin/sh
+# Installed by make-real-laptop.sh
+/usr/bin/usb-devices.real "$@" | sed \
+  -e 's/Vendor=0e0f ProdID=0003/Vendor=046d ProdID=c077/g' \
+  -e 's/Vendor=0e0f ProdID=0001/Vendor=046d ProdID=c077/g' \
+  -e 's/Vendor=0e0f ProdID=0002/Vendor=8087 ProdID=0024/g' \
+  -e 's/Manufacturer=VMware, Inc\./Manufacturer=Logitech, Inc./g' \
+  -e 's/Product=VMware Virtual USB Mouse/Product=M105 Optical Mouse/g' \
+  -e 's/Product=VMware Virtual Mouse/Product=M105 Optical Mouse/g' \
+  -e 's/Product=VMware Virtual USB Hub/Product=Integrated Rate Matching Hub/g' \
+  | grep -viE 'vmware|0e0f' || true
+EOF
+  chmod 755 "${USBDEVICES_BIN}"
+  fi
+
   # vmtoolsd must keep running (Tools / clipboard / display). Only hide it from
   # `ps` listings. Do not wrap pgrep/pidof — open-vm-tools uses those.
   ensure_divert "${PS_BIN}" "${PS_REAL}"
@@ -1000,6 +1125,8 @@ remove_virt_wrapper() {
   remove_divert "${LSCPU_BIN}" "${LSCPU_REAL}"
   remove_divert "${HOSTNAMECTL_BIN}" "${HOSTNAMECTL_REAL}"
   remove_divert "${LSPCI_BIN}" "${LSPCI_REAL}"
+  remove_divert "${LSUSB_BIN}" "${LSUSB_REAL}"
+  remove_divert "${USBDEVICES_BIN}" "${USBDEVICES_REAL}"
   remove_divert "${PS_BIN}" "${PS_REAL}"
   remove_divert "${LSBLK_BIN}" "${LSBLK_REAL}"
   remove_divert "${LSSCSI_BIN}" "${LSSCSI_REAL}"
@@ -1045,7 +1172,7 @@ Do not add these (and remove them if you already did):
   cpuid.40000000.eax / ebx / ecx / edx = ...
   isolation.tools.getVersion.disable = "TRUE"
 
-Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, lspci, ps, lsblk, and ethtool.
+Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, lspci, lsusb, ps, lsblk, and ethtool.
 Tools still run, but under the process name gsd-disk-mon and dirs gsd-hw-helper / hw-assist-cfg.
 Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
 
@@ -1073,6 +1200,7 @@ cmd_apply() {
   apply_cpuinfo
   hide_sys_hypervisor
   apply_block_identity
+  apply_usb_identity
   apply_tools_camouflage
   apply_hostname
   install_virt_wrapper
@@ -1109,6 +1237,7 @@ cmd_revert() {
   done
   findmnt -n /proc/cpuinfo >/dev/null 2>&1 && umount /proc/cpuinfo 2>/dev/null || true
   unmount_block_identity
+  unmount_usb_identity
   remove_tools_camouflage
   if [[ -d /sys/hypervisor ]] && findmnt -n /sys/hypervisor >/dev/null 2>&1; then
     [[ "$(findmnt -n -o FSTYPE /sys/hypervisor 2>/dev/null || true)" == "tmpfs" ]] \
@@ -1246,6 +1375,14 @@ cmd_status() {
     fi
   fi
   echo "(Close and reopen GNOME Disks if it still shows VMware — it caches drive names.)"
+  if command -v lsusb >/dev/null 2>&1; then
+    echo
+    echo "=== lsusb (VMware / 0e0f must be absent) ==="
+    lsusb
+    if lsusb | grep -Ei 'vmware|0e0f'; then
+      echo "NOTE: lsusb still names VMware USB — re-run: sudo bash $0 install"
+    fi
+  fi
 }
 
 usage() {
