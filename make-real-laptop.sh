@@ -824,12 +824,23 @@ nautilus_unhide_all() {
 }
 
 write_vmtoolsd_trampoline() {
+  # Fall back to stock plugin/config paths if camouflage copies are incomplete.
+  # USB passthrough is host-side, but a dead vmtoolsd can make Workstation
+  # abort Connect with "The connection for the USB device was unsuccessful".
+  local stock=""
+  stock="$(find_ovt_plugin_root || true)"
+  [[ -n "${stock}" ]] || stock="/usr/lib/x86_64-linux-gnu/open-vm-tools"
   cat >"${VMTOOLSD_BIN}" <<EOF
 #!/bin/sh
 # Installed by make-real-laptop.sh
 bin='${TOOLS_CAMO_BIN}'
+[ -x "\$bin" ] || bin='${VMTOOLSD_REAL}'
+[ -x "\$bin" ] || bin=/usr/bin/vmtoolsd.real
 conf='${TOOLS_CAMO_CONF}/tools.conf'
+[ -f "\$conf" ] || conf=/etc/vmware-tools/tools.conf
 common='${TOOLS_CAMO_PLUGIN}/plugins/common'
+[ -d "\$common" ] || common='${stock}/plugins/common'
+[ -d "\$common" ] || common=/usr/lib/x86_64-linux-gnu/open-vm-tools/plugins/common
 name=vmsvc
 prev=
 for a in "\$@"; do
@@ -842,7 +853,9 @@ for a in "\$@"; do
   prev=\${a}
 done
 plugin='${TOOLS_CAMO_PLUGIN}/plugins/'"\${name}"
-exec "\${bin}" --config "\${conf}" --common-path "\${common}" --plugin-path "\${plugin}" "\$@"
+[ -d "\$plugin" ] || plugin='${stock}/plugins/'"\${name}"
+[ -d "\$plugin" ] || plugin=/usr/lib/x86_64-linux-gnu/open-vm-tools/plugins/"\${name}"
+exec "\$bin" --config "\$conf" --common-path "\$common" --plugin-path "\$plugin" "\$@"
 EOF
   chmod 755 "${VMTOOLSD_BIN}"
 }
@@ -873,9 +886,7 @@ apply_tools_camouflage() {
   plugin_src="$(find_ovt_plugin_root || true)"
   if [[ -n "${plugin_src}" && -d "${plugin_src}" ]]; then
     mkdir -p "${TOOLS_CAMO_PLUGIN}"
-    if [[ ! -d "${TOOLS_CAMO_PLUGIN}/plugins/vmsvc" || "${src}" -nt "${TOOLS_CAMO_PLUGIN}/plugins" ]]; then
-      cp -a "${plugin_src}/." "${TOOLS_CAMO_PLUGIN}/"
-    fi
+    cp -a "${plugin_src}/." "${TOOLS_CAMO_PLUGIN}/"
   fi
 
   conf_src="/etc/vmware-tools"
@@ -883,6 +894,7 @@ apply_tools_camouflage() {
     mkdir -p "${TOOLS_CAMO_CONF}"
     cp -a "${conf_src}/." "${TOOLS_CAMO_CONF}/" 2>/dev/null || true
   fi
+  # Keep guest RPC enabled. Do not add isolation/disable stanzas here.
 
   ensure_divert "${VMTOOLSD_BIN}" "${VMTOOLSD_REAL}"
   write_vmtoolsd_trampoline
@@ -1299,7 +1311,7 @@ EOF
 }
 
 print_camera_hint() {
-  local has_uhci=0 has_ehci=0 has_xhci=0 has_cam=0 mixed=0
+  local has_uhci=0 has_ehci=0 has_xhci=0 has_cam=0 mixed=0 tools_ok="unknown"
   [[ -d /sys/bus/pci/drivers/uhci_hcd ]] && ls /sys/bus/pci/drivers/uhci_hcd/0000:* >/dev/null 2>&1 && has_uhci=1
   [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1 && has_ehci=1
   if [[ -d /sys/bus/pci/drivers/xhci_hcd ]] && ls /sys/bus/pci/drivers/xhci_hcd/0000:* >/dev/null 2>&1; then
@@ -1311,81 +1323,118 @@ print_camera_hint() {
   if [[ $((has_uhci + has_ehci + has_xhci)) -gt 1 ]]; then
     mixed=1
   fi
+  if command -v vmware-checkvm >/dev/null 2>&1; then
+    if vmware-checkvm >/dev/null 2>&1; then
+      tools_ok="hypervisor backdoor ok"
+    else
+      tools_ok="vmware-checkvm failed (Tools/RPC broken)"
+    fi
+  fi
 
   cat <<'EOF'
 
-=== USB camera — "connection was unsuccessful" is a HOST/VMware failure =====
-The guest script cannot attach a camera. If VMware says the connection was
-unsuccessful, the device never reaches Linux (no /dev/video*). That is not
-a Cheese/Chrome/Zoom bug.
+=== USB camera — two different failures (do not mix them) ====================
+
+1) VMware yellow warning:
+     The connection for the USB device 'Sunplus Innovation USB Camera' was unsuccessful.
+   The host never handed the device to Linux. There is no /dev/video*, so
+   PipeWire / Snapshot / Cheese cannot help yet.
+   AskUbuntu 1511671 is NOT this stage.
+
+2) After Connect succeeds and /dev/video0 exists:
+   Ubuntu 24.04 Snapshot + PipeWire/libcamera can still fail to open the
+   stream. Then use Cheese + v4l2 (AskUbuntu 1511671).
+
+Tools camouflage (gsd-disk-mon) does not implement USB. open-vm-tools has
+no USB-passthrough plugin. A *dead* Tools process can still make Workstation
+abort Connect; the trampoline now falls back to stock plugin paths.
 
 This guest currently has:
 EOF
   echo "  UHCI (USB 1.1): $([[ ${has_uhci} -eq 1 ]] && echo yes || echo no)"
   echo "  EHCI (USB 2.0): $([[ ${has_ehci} -eq 1 ]] && echo yes || echo no)"
   echo "  xHCI (USB 3.x): $([[ ${has_xhci} -eq 1 ]] && echo yes || echo no)"
+  echo "  Tools RPC:      ${tools_ok}"
+  local comm pid
+  for pid in /proc/[0-9]*; do
+    comm="$(cat "${pid}/comm" 2>/dev/null || true)"
+    case "${comm}" in
+      gsd-disk-mon) echo "  tools daemon:   gsd-disk-mon running (pid ${pid#/proc/})" ;;
+      vmtoolsd)     echo "  tools daemon:   STILL vmtoolsd (pid ${pid#/proc/}) — re-run install" ;;
+    esac
+  done
   if [[ "${has_cam}" -eq 1 ]]; then
-    echo "  /dev/video*: present"
+    echo "  /dev/video*: present — Connect worked. Use Cheese, not Snapshot:"
     ls -l /dev/video* 2>/dev/null || true
+    cat <<'EOF'
+
+     sudo apt-get install -y v4l-utils cheese
+     v4l2-ctl --list-devices
+     cheese
+
+   Snapshot on 24.04 talks PipeWire/libcamera; cheap Sunplus UVC is v4l2.
+   Restart PipeWire only after the node exists:
+     systemctl --user restart pipewire wireplumber
+EOF
     return 0
   fi
-  echo "  /dev/video*: none"
+  echo "  /dev/video*: none  ← you are still in stage 1 (host USB attach)"
   if [[ "${mixed}" -eq 1 ]]; then
     echo
-    echo "All three USB stacks are present. VMware then often fails UVC attach"
-    echo "with exactly \"The connection for the USB device was unsuccessful\"."
+    echo "  Mixed USB 1.1+2.0+3.x controllers are present. VMware often then"
+    echo "  fails UVC with exactly \"connection was unsuccessful\"."
   fi
 
   cat <<'EOF'
 
-Do this on the HOST (power the VM fully OFF — not Suspend):
+Stage 1 — HOST (power the VM fully OFF, not Suspend). Do not add CPUID masks.
 
-1. Close anything on the host that owns the camera (Camera app, Teams, Zoom,
-   Chrome). On Windows: restart "VMware USB Arbitration Service" in services.msc.
+A. Close host Camera / Teams / Zoom / Chrome. Windows Privacy > Camera:
+   allow desktop apps, then close those apps so Frame Server releases it.
+   services.msc → VMware USB Arbitration Service → Restart (startup Automatic).
 
-2. Pick ONE USB controller, not USB 2 + USB 3 together.
-   VM -> Settings -> USB Controller -> USB compatibility:
+B. VM Settings → USB Controller → USB compatibility = USB 2.0
+   (Sunplus UVC; USB 3.1 + leftover EHCI together is a common 25H2 failure).
 
-   First try: USB 2.0   (best for cheap Sunplus/UVC cams)
-   If that still fails: USB 3.1
-
-3. Edit the .vmx next to the .vmx you open in Workstation. Remove leftover
-   lines from the other compatibility. For USB 2.0 only:
+C. Edit the .vmx (same folder as the VM). Keep ONE controller, force
+   passthrough, disable VMware's virtual camera (Windows 11 intercepts UVC):
 
      usb.present = "TRUE"
      ehci.present = "TRUE"
      usb_xhci.present = "FALSE"
+     usb.generic.allowHID = "TRUE"
+     vusb.camera = "FALSE"
+     vusbcamera.passthrough = "TRUE"
 
-   For USB 3.1 only:
+   If USB 2.0 still fails, power off and switch to USB 3.1 ONLY:
 
      usb.present = "TRUE"
      ehci.present = "FALSE"
      usb_xhci.present = "TRUE"
-
-   Also add (do not use CPUID masks):
-
      usb.generic.allowHID = "TRUE"
+     vusb.camera = "FALSE"
+     vusbcamera.passthrough = "TRUE"
 
-4. Webcam quirks (Broadcom KB 315312). In the same folder as the .vmx, open
-   vmware.log after a failed connect and search for "USB: Found device".
-   Note vid: and pid:, then add ONE of these lines (try in this order,
-   power off between tries):
+D. After a failed Connect, open vmware.log next to the .vmx and search
+   "USB: Found device". Note vid: and pid: (Sunplus is often 1bcf). Add ONE
+   line (Broadcom KB 315312), power off between tries:
 
      usb.quirks.device0 = "0xVID:0xPID skip-reset"
      usb.quirks.device0 = "0xVID:0xPID skip-refresh"
      usb.quirks.device0 = "0xVID:0xPID skip-setconfig"
      usb.quirks.device0 = "0xVID:0xPID skip-reset, skip-refresh, skip-setconfig"
 
-   Example if the log says vid:1bcf pid:0c31:
+   Example:
 
      usb.quirks.device0 = "0x1bcf:0x0c31 skip-reset, skip-refresh, skip-setconfig"
 
-5. Power on. Click into the VM. Then:
-     VM -> Removable Devices -> (camera) -> Connect (Disconnect from host)
+E. Power on. Click into the VM. Then:
+     VM → Removable Devices → Sunplus Innovation USB Camera
+       → Connect (Disconnect from host)
 
-6. In the guest:
+F. Guest check (real binary, not the lsusb wrapper):
 
-     /usr/bin/lsusb.real
+     /usr/bin/lsusb.real | grep -iE 'sunplus|1bcf|camera'
      ls -l /dev/video*
 
 A spoofed Latitude DMI does not create a built-in webcam.
@@ -1698,9 +1747,15 @@ if not found:
   else
     echo "no /dev/video* — camera is not on the guest USB bus."
     echo "Spoofing DMI as a Latitude does not create a webcam."
-    echo "If VMware said \"connection was unsuccessful\", the host never passed"
-    echo "the device in. This guest has mixed USB 1.1+2.0+3.x controllers — that"
-    echo "is a common cause. See:  bash $0 camera"
+    echo "If VMware said \"connection was unsuccessful\", that is host USB attach"
+    echo "(not PipeWire/Snapshot). See:  bash $0 camera"
+    local nctl=0
+    [[ -d /sys/bus/pci/drivers/uhci_hcd ]] && ls /sys/bus/pci/drivers/uhci_hcd/0000:* >/dev/null 2>&1 && nctl=$((nctl + 1))
+    [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1 && nctl=$((nctl + 1))
+    [[ -d /sys/bus/pci/drivers/xhci_hcd ]] && ls /sys/bus/pci/drivers/xhci_hcd/0000:* >/dev/null 2>&1 && nctl=$((nctl + 1))
+    if [[ "${nctl}" -gt 1 ]]; then
+      echo "This guest has mixed USB 1.1+2.0+3.x controllers — a common cause."
+    fi
   fi
 }
 
