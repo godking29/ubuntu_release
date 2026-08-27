@@ -28,8 +28,8 @@
 #   6. wraps lspci so vendor 15ad / "VMware" device names are rewritten to
 #      Intel. The real PCI IDs in sysfs are unchanged (changing them would
 #      break GPU, disk, USB, and VMware Tools).
-#   6b. wraps lsusb so vendor 0e0f (VMware Virtual Mouse / USB Hub) is
-#      rewritten to Logitech / Intel. Real USB IDs stay 0e0f.
+#   6b. wraps lsusb so vendor 0e0f names are rewritten. Does not bind-mount or
+#      udev-rename the VMware virtual USB hub (needed to attach a USB camera).
 #   7. spoofs SCSI model/vendor in sysfs + udev (so GNOME Disks / UDisks2
 #      show Samsung, not VMware). lsblk is also wrapped. Optical drive is
 #      hidden from Disks (UDISKS_IGNORE).
@@ -39,6 +39,10 @@
 #      dirs (gsd-hw-helper / hw-assist-cfg). Original package paths stay for
 #      apt; Files/Nautilus hides them via .hidden. Do not uninstall
 #      open-vm-tools — clipboard and display need it.
+#  11. PipeWire/Pulse keep VM-sized audio buffers. Cloaking systemd-detect-virt
+#      otherwise makes them use laptop low-latency settings, which chops USB
+#      headset mics. USB udev is not globally triggered (that also glitches
+#      isochronous audio).
 #
 set -euo pipefail
 
@@ -72,10 +76,16 @@ ETHTOOL_REAL_ALT="/usr/bin/ethtool.real"
 HOSTNAMED_DROPIN="/etc/systemd/system/systemd-hostnamed.service.d/make-real-laptop.conf"
 UDEV_DISK_RULE="/etc/udev/rules.d/99-make-real-laptop-disk.rules"
 UDEV_USB_RULE="/etc/udev/rules.d/99-make-real-laptop-usb.rules"
+UDEV_V4L_RULE="/etc/udev/rules.d/99-make-real-laptop-v4l.rules"
 DISK_ID_HELPER="/usr/libexec/make-real-laptop-disk-id"
 UDISKS_DROPIN="/etc/systemd/system/udisks2.service.d/make-real-laptop.conf"
 INQUIRY_SRC="${STATE_DIR}/fakeinquiry.c"
 INQUIRY_SO="/usr/lib/make-real-laptop/libfakeinquiry.so"
+PIPEWIRE_CONF="/etc/pipewire/pipewire.conf.d/99-make-real-laptop.conf"
+PIPEWIRE_PULSE_CONF="/etc/pipewire/pipewire-pulse.conf.d/99-make-real-laptop.conf"
+WIREPLUMBER_LUA="/etc/wireplumber/main.lua.d/99-make-real-laptop.lua"
+WIREPLUMBER_CONF="/etc/wireplumber/wireplumber.conf.d/99-make-real-laptop.conf"
+PULSE_ENV="/etc/environment.d/99-make-real-laptop-audio.conf"
 HOSTNAME_NEW="dell-laptop"
 
 # SCSI INQUIRY widths: vendor 8, product 16, revision 4. Latitude 5540 NVMe.
@@ -549,59 +559,55 @@ unmount_block_identity() {
   fi
 }
 
-usb_spoof_for_pid() {
-  local pid="$1"
-  case "${pid}" in
-    0003|0001)
-      printf '%s\n' "Logitech, Inc." "M105 Optical Mouse"
-      ;;
-    0002)
-      printf '%s\n' "Intel Corp." "Integrated Rate Matching Hub"
-      ;;
-    *)
-      printf '%s\n' "Intel Corp." "USB Composite Device"
-      ;;
-  esac
+usb_is_passthrough_path() {
+  local d="$1" pid class
+  pid="$(tr -d '[:space:]' <"${d}/idProduct" 2>/dev/null || true)"
+  class="$(tr -d '[:space:]' <"${d}/bDeviceClass" 2>/dev/null || true)"
+  # 0002/0006 = VMware virtual USB hub (USB2/USB3). Cameras are attached here.
+  # 09 = USB hub class.
+  [[ "${pid}" == "0002" || "${pid}" == "0006" || "${class}" == "09" ]]
+}
+
+usb_has_av_interface() {
+  local d="$1" f cls
+  for f in "${d}"/*:*/bInterfaceClass "${d}"/*/bInterfaceClass; do
+    [[ -f "${f}" ]] || continue
+    cls="$(tr -d '[:space:]' <"${f}")"
+    # 01 audio, 0e video/UVC — never bind-mount these
+    [[ "${cls}" == "01" || "${cls}" == "0e" ]] && return 0
+  done
+  return 1
 }
 
 apply_usb_identity() {
-  local d vid pid name dir mfr prod
+  local d vid
+  # Undo hub bind-mounts / udev from older script versions. The VMware
+  # virtual hub must stay untouched or Workstation cannot attach a USB camera.
+  unmount_usb_identity
   mkdir -p "${RUNTIME_DIR}/usb"
   for d in /sys/bus/usb/devices/*; do
     [[ -f "${d}/idVendor" ]] || continue
     vid="$(tr -d '[:space:]' <"${d}/idVendor" 2>/dev/null || true)"
     [[ "${vid}" == "0e0f" ]] || continue
-    pid="$(tr -d '[:space:]' <"${d}/idProduct" 2>/dev/null || true)"
-    name="$(basename "${d}")"
-    dir="${RUNTIME_DIR}/usb/${name}"
-    mkdir -p "${dir}"
-    {
-      read -r mfr
-      read -r prod
-    } < <(usb_spoof_for_pid "${pid}")
-    printf '%s\n' "${mfr}" >"${dir}/manufacturer"
-    printf '%s\n' "${prod}" >"${dir}/product"
-    chmod 444 "${dir}/manufacturer" "${dir}/product"
-    [[ -e "${d}/manufacturer" ]] && bind_file "${dir}/manufacturer" "${d}/manufacturer"
-    [[ -e "${d}/product" ]] && bind_file "${dir}/product" "${d}/product"
+    usb_is_passthrough_path "${d}" && continue
+    usb_has_av_interface "${d}" && continue
+    # Do not bind-mount remaining 0e0f devices either — lsusb wrap is enough.
   done
-  cat >"${UDEV_USB_RULE}" <<'EOF'
-# Installed by make-real-laptop.sh — display names only. Real idVendor stays 0e0f.
-SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", ATTR{idProduct}=="0003", \
-  ENV{ID_VENDOR}="Logitech, Inc.", ENV{ID_MODEL}="M105 Optical Mouse", \
-  ENV{ID_VENDOR_FROM_DATABASE}="Logitech, Inc.", ENV{ID_MODEL_FROM_DATABASE}="M105 Optical Mouse"
-SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", ATTR{idProduct}=="0001", \
-  ENV{ID_VENDOR}="Logitech, Inc.", ENV{ID_MODEL}="M105 Optical Mouse", \
-  ENV{ID_VENDOR_FROM_DATABASE}="Logitech, Inc.", ENV{ID_MODEL_FROM_DATABASE}="M105 Optical Mouse"
-SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", ATTR{idProduct}=="0002", \
-  ENV{ID_VENDOR}="Intel Corp.", ENV{ID_MODEL}="Integrated Rate Matching Hub", \
-  ENV{ID_VENDOR_FROM_DATABASE}="Intel Corp.", ENV{ID_MODEL_FROM_DATABASE}="Integrated Rate Matching Hub"
-SUBSYSTEM=="usb", ATTR{idVendor}=="0e0f", \
-  ENV{ID_VENDOR}="Intel Corp.", ENV{ID_VENDOR_FROM_DATABASE}="Intel Corp."
+  cat >"${UDEV_V4L_RULE}" <<'EOF'
+# make-real-laptop.sh — passthrough UVC cameras (e.g. Sunplus) need uaccess
+SUBSYSTEM=="video4linux", GROUP="video", MODE="0660", TAG+="uaccess"
+KERNEL=="video[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess"
 EOF
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
+  fi
+  modprobe uvcvideo 2>/dev/null || true
+  local user
+  if getent group video >/dev/null 2>&1; then
+    while read -r _ user _; do
+      [[ -n "${user}" && "${user}" != "root" ]] || continue
+      usermod -aG video "${user}" 2>/dev/null || true
+    done < <(loginctl list-users --no-legend 2>/dev/null || true)
   fi
 }
 
@@ -614,11 +620,71 @@ unmount_usb_identity() {
       fi
     done
   done
-  rm -f "${UDEV_USB_RULE}"
+  rm -f "${UDEV_USB_RULE}" "${UDEV_V4L_RULE}"
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=usb --action=change 2>/dev/null || true
   fi
+}
+
+apply_audio_vm_buffers() {
+  mkdir -p /etc/pipewire/pipewire.conf.d /etc/pipewire/pipewire-pulse.conf.d \
+    /etc/wireplumber/main.lua.d /etc/wireplumber/wireplumber.conf.d \
+    /etc/environment.d
+  cat >"${PIPEWIRE_CONF}" <<'EOF'
+# make-real-laptop.sh — systemd-detect-virt is cloaked to "none", so PipeWire
+# would pick laptop low-latency quanta. This guest is still a VM; USB mics chop
+# unless the quantum stays large.
+context.properties = {
+    default.clock.rate        = 48000
+    default.clock.quantum     = 1024
+    default.clock.min-quantum = 1024
+    default.clock.max-quantum = 2048
+}
+EOF
+  cat >"${PIPEWIRE_PULSE_CONF}" <<'EOF'
+# make-real-laptop.sh
+pulse.properties = {
+    pulse.min.req          = 1024/48000
+    pulse.min.quantum      = 1024/48000
+    pulse.default.req      = 1024/48000
+    pulse.default.frag     = 1024/48000
+}
+EOF
+  cat >"${WIREPLUMBER_LUA}" <<'EOF'
+-- make-real-laptop.sh (WirePlumber 0.4) — ALSA only. Do not touch v4l2/libcamera.
+if alsa_monitor ~= nil and alsa_monitor.properties ~= nil then
+  alsa_monitor.properties["session.suspend-timeout-seconds"] = 0
+end
+EOF
+  # Do not write wireplumber.conf.d: on 0.4 it can break the v4l2 camera monitor.
+  rm -f "${WIREPLUMBER_CONF}"
+  cat >"${PULSE_ENV}" <<'EOF'
+PIPEWIRE_LATENCY=1024/48000
+PULSE_LATENCY_MSEC=60
+EOF
+  restart_user_audio
+}
+
+remove_audio_vm_buffers() {
+  rm -f "${PIPEWIRE_CONF}" "${PIPEWIRE_PULSE_CONF}" "${WIREPLUMBER_LUA}" \
+    "${WIREPLUMBER_CONF}" "${PULSE_ENV}"
+  rmdir /etc/pipewire/pipewire.conf.d /etc/pipewire/pipewire-pulse.conf.d \
+    /etc/wireplumber/main.lua.d /etc/wireplumber/wireplumber.conf.d \
+    /etc/environment.d 2>/dev/null || true
+  restart_user_audio
+}
+
+restart_user_audio() {
+  [[ "$(systemctl is-system-running 2>/dev/null || true)" =~ ^(running|degraded)$ ]] || return 0
+  local uid runtime
+  for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+    [[ -n "${uid}" && "${uid}" != "0" ]] || continue
+    runtime="/run/user/${uid}"
+    [[ -d "${runtime}" ]] || continue
+    sudo -u "#${uid}" XDG_RUNTIME_DIR="${runtime}" \
+      systemctl --user try-restart pipewire.service pipewire-pulse.service wireplumber.service pulseaudio.service \
+      >/dev/null 2>&1 || true
+  done
 }
 
 is_elf() {
@@ -1201,6 +1267,7 @@ cmd_apply() {
   hide_sys_hypervisor
   apply_block_identity
   apply_usb_identity
+  apply_audio_vm_buffers
   apply_tools_camouflage
   apply_hostname
   install_virt_wrapper
@@ -1222,7 +1289,9 @@ cmd_install() {
   echo
   echo "installed. identity is applied and will re-apply at boot."
   echo "Log out of GNOME only if status still lists a vmtoolsd process."
-  echo "Close GNOME Disks and open it again to refresh the drive model."
+  echo "USB camera: VM Settings -> Removable Devices -> camera -> Connect, then:"
+  echo "  lsusb | grep -iE 'sunplus|camera|1bcf'; ls -l /dev/video*"
+  echo "Log out/in once if you were just added to the video group."
   print_vmx_hint
   cmd_status
 }
@@ -1238,6 +1307,7 @@ cmd_revert() {
   findmnt -n /proc/cpuinfo >/dev/null 2>&1 && umount /proc/cpuinfo 2>/dev/null || true
   unmount_block_identity
   unmount_usb_identity
+  remove_audio_vm_buffers
   remove_tools_camouflage
   if [[ -d /sys/hypervisor ]] && findmnt -n /sys/hypervisor >/dev/null 2>&1; then
     [[ "$(findmnt -n -o FSTYPE /sys/hypervisor 2>/dev/null || true)" == "tmpfs" ]] \
