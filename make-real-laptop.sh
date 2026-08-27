@@ -39,10 +39,11 @@
 #      dirs (gsd-hw-helper / hw-assist-cfg). Original package paths stay for
 #      apt; Files/Nautilus hides them via .hidden. Do not uninstall
 #      open-vm-tools — clipboard and display need it.
-#  11. PipeWire/Pulse keep VM-sized audio buffers. Cloaking systemd-detect-virt
-#      otherwise makes them use laptop low-latency settings, which chops USB
-#      headset mics. USB udev is not globally triggered (that also glitches
-#      isochronous audio).
+#  11. PipeWire/Pulse/WirePlumber keep VM-sized audio buffers AND ALSA
+#      headroom. Cloaking systemd-detect-virt makes PipeWire skip vm.overrides
+#      and WirePlumber skip vm.node.defaults (api.alsa.headroom=8192). Without
+#      that, the emulated ES1371 and USB mics chop. USB udev is not globally
+#      triggered (that also glitches isochronous audio).
 #
 set -euo pipefail
 
@@ -83,9 +84,12 @@ INQUIRY_SRC="${STATE_DIR}/fakeinquiry.c"
 INQUIRY_SO="/usr/lib/make-real-laptop/libfakeinquiry.so"
 PIPEWIRE_CONF="/etc/pipewire/pipewire.conf.d/99-make-real-laptop.conf"
 PIPEWIRE_PULSE_CONF="/etc/pipewire/pipewire-pulse.conf.d/99-make-real-laptop.conf"
-WIREPLUMBER_LUA="/etc/wireplumber/main.lua.d/99-make-real-laptop.lua"
+PIPEWIRE_CLIENT_CONF="/etc/pipewire/client.conf.d/99-make-real-laptop.conf"
+WIREPLUMBER_LUA="/etc/wireplumber/main.lua.d/51-make-real-laptop.lua"
+WIREPLUMBER_LUA_OLD="/etc/wireplumber/main.lua.d/99-make-real-laptop.lua"
 WIREPLUMBER_CONF="/etc/wireplumber/wireplumber.conf.d/99-make-real-laptop.conf"
 PULSE_ENV="/etc/environment.d/99-make-real-laptop-audio.conf"
+MODPROBE_USB="/etc/modprobe.d/99-make-real-laptop-usb.conf"
 HOSTNAME_NEW="dell-laptop"
 
 # SCSI INQUIRY widths: vendor 8, product 16, revision 4. Latitude 5540 NVMe.
@@ -592,12 +596,23 @@ apply_usb_identity() {
     done
   done
   rm -f "${UDEV_USB_RULE}"
-  mkdir -p "${RUNTIME_DIR}/usb"
+  mkdir -p "${RUNTIME_DIR}/usb" "$(dirname "${MODPROBE_USB}")"
   cat >"${UDEV_V4L_RULE}" <<'EOF'
 # make-real-laptop.sh — passthrough UVC cameras need uaccess
-SUBSYSTEM=="video4linux", GROUP="video", MODE="0660", TAG+="uaccess"
-KERNEL=="video[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess"
+# Do not `udevadm trigger -s usb` after writing this (glitches USB mics).
+SUBSYSTEM=="video4linux", GROUP="video", MODE="0660", TAG+="uaccess", TAG+="seat"
+KERNEL=="video[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess", TAG+="seat"
+KERNEL=="media[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess"
+# Isochronous devices in a VM fail if the host autosuspends them.
+ACTION=="add", SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:0e*:*", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:01*:*", ATTR{power/control}="on"
 EOF
+  cat >"${MODPROBE_USB}" <<'EOF'
+# make-real-laptop.sh — VMware USB isochronous (UVC / headset) needs this.
+options usbcore autosuspend=-1
+options uvcvideo nodrop=1 timeout=5000
+EOF
+  echo -1 >/sys/module/usbcore/parameters/autosuspend 2>/dev/null || true
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
   fi
@@ -608,13 +623,21 @@ EOF
   modprobe xhci_hcd 2>/dev/null || true
   modprobe uvcvideo 2>/dev/null || true
   modprobe snd-usb-audio 2>/dev/null || true
-  local user
-  if getent group video >/dev/null 2>&1; then
+  local user grp
+  for grp in video audio plugdev; do
+    getent group "${grp}" >/dev/null 2>&1 || continue
     while read -r _ user _; do
       [[ -n "${user}" && "${user}" != "root" ]] || continue
-      usermod -aG video "${user}" 2>/dev/null || true
+      usermod -aG "${grp}" "${user}" 2>/dev/null || true
     done < <(loginctl list-users --no-legend 2>/dev/null || true)
-  fi
+  done
+  # Already-attached UVC/headset: disable autosuspend without a USB retrigger.
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f "${d}/idVendor" ]] || continue
+    usb_has_av_interface "${d}" || continue
+    echo on >"${d}/power/control" 2>/dev/null || true
+    echo -1 >"${d}/power/autosuspend" 2>/dev/null || true
+  done
 }
 
 unmount_usb_identity() {
@@ -626,7 +649,7 @@ unmount_usb_identity() {
       fi
     done
   done
-  rm -f "${UDEV_USB_RULE}" "${UDEV_V4L_RULE}"
+  rm -f "${UDEV_USB_RULE}" "${UDEV_V4L_RULE}" "${MODPROBE_USB}"
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
   fi
@@ -634,30 +657,65 @@ unmount_usb_identity() {
 
 apply_audio_vm_buffers() {
   mkdir -p /etc/pipewire/pipewire.conf.d /etc/pipewire/pipewire-pulse.conf.d \
+    /etc/pipewire/client.conf.d \
     /etc/wireplumber/main.lua.d /etc/wireplumber/wireplumber.conf.d \
     /etc/environment.d
+  # 99-*.lua runs *after* 90-enable-all.lua, so ALSA nodes are already created
+  # without VM headroom. 51- loads after 50-alsa-config.lua, before enable().
+  rm -f "${WIREPLUMBER_LUA_OLD}"
   cat >"${PIPEWIRE_CONF}" <<'EOF'
-# make-real-laptop.sh — virt is cloaked; keep VM-sized buffers for USB mics.
+# make-real-laptop.sh — virt is cloaked; PipeWire skips its own vm.overrides.
 context.properties = {
-    default.clock.rate        = 48000
-    default.clock.quantum     = 2048
-    default.clock.min-quantum = 1024
-    default.clock.max-quantum = 4096
+    default.clock.rate          = 48000
+    default.clock.quantum       = 2048
+    default.clock.min-quantum   = 2048
+    default.clock.max-quantum   = 8192
+    default.clock.quantum-limit = 8192
 }
 EOF
   cat >"${PIPEWIRE_PULSE_CONF}" <<'EOF'
 # make-real-laptop.sh
 pulse.properties = {
-    pulse.min.req          = 1024/48000
-    pulse.min.quantum      = 1024/48000
+    pulse.min.req          = 2048/48000
+    pulse.min.quantum      = 2048/48000
     pulse.default.req      = 2048/48000
     pulse.default.frag     = 2048/48000
 }
 EOF
+  cat >"${PIPEWIRE_CLIENT_CONF}" <<'EOF'
+# make-real-laptop.sh — Chrome / native PipeWire clients
+stream.properties = {
+    node.latency = 2048/48000
+}
+EOF
   cat >"${WIREPLUMBER_LUA}" <<'EOF'
--- make-real-laptop.sh (WirePlumber 0.4) — ALSA only, not v4l2.
-if alsa_monitor ~= nil and alsa_monitor.properties ~= nil then
-  alsa_monitor.properties["session.suspend-timeout-seconds"] = 0
+-- make-real-laptop.sh (WirePlumber 0.4) — ALSA only, not v4l2/libcamera.
+-- Must be named 51-* so it runs after 50-alsa-config.lua and BEFORE
+-- 90-enable-all.lua. Core.get_vm_type() is empty while virt is cloaked,
+-- so vm.node.defaults never apply; force the same values via rules.
+if alsa_monitor ~= nil then
+  alsa_monitor.properties = alsa_monitor.properties or {}
+  alsa_monitor.rules = alsa_monitor.rules or {}
+  alsa_monitor.properties["vm.node.defaults"] = {
+    ["api.alsa.period-size"] = 1024,
+    ["api.alsa.headroom"] = 8192,
+  }
+  -- Strings: WP 0.4 drops numeric api.alsa.* from the SPA dict.
+  table.insert(alsa_monitor.rules, {
+    matches = {
+      {
+        { "node.name", "matches", "alsa_input.*" },
+      },
+      {
+        { "node.name", "matches", "alsa_output.*" },
+      },
+    },
+    apply_properties = {
+      ["api.alsa.period-size"] = "1024",
+      ["api.alsa.headroom"] = "8192",
+      ["session.suspend-timeout-seconds"] = 0,
+    },
+  })
 end
 EOF
   # 0.4 uses lua only. A .conf drop-in on 0.4 can break the v4l2 monitor.
@@ -667,9 +725,21 @@ EOF
     mkdir -p "$(dirname "${WIREPLUMBER_CONF}")"
     cat >"${WIREPLUMBER_CONF}" <<'EOF'
 # make-real-laptop.sh (WirePlumber 0.5) — ALSA fragment only; v4l2 stays default.
-monitor.alsa.properties = {
-  ["session.suspend-timeout-seconds"] = 0
-}
+monitor.alsa.rules = [
+  {
+    matches = [
+      { node.name = "~alsa_input.*" }
+      { node.name = "~alsa_output.*" }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.period-size = 1024
+        api.alsa.headroom = 8192
+        session.suspend-timeout-seconds = 0
+      }
+    }
+  }
+]
 EOF
   else
     rm -f "${WIREPLUMBER_CONF}"
@@ -678,12 +748,15 @@ EOF
 PIPEWIRE_LATENCY=2048/48000
 PULSE_LATENCY_MSEC=80
 EOF
+  restart_user_audio
 }
 
 remove_audio_vm_buffers() {
-  rm -f "${PIPEWIRE_CONF}" "${PIPEWIRE_PULSE_CONF}" "${WIREPLUMBER_LUA}" \
-    "${WIREPLUMBER_CONF}" "${PULSE_ENV}"
+  rm -f "${PIPEWIRE_CONF}" "${PIPEWIRE_PULSE_CONF}" "${PIPEWIRE_CLIENT_CONF}" \
+    "${WIREPLUMBER_LUA}" "${WIREPLUMBER_LUA_OLD}" "${WIREPLUMBER_CONF}" \
+    "${PULSE_ENV}"
   rmdir /etc/pipewire/pipewire.conf.d /etc/pipewire/pipewire-pulse.conf.d \
+    /etc/pipewire/client.conf.d \
     /etc/wireplumber/main.lua.d /etc/wireplumber/wireplumber.conf.d \
     /etc/environment.d 2>/dev/null || true
   restart_user_audio
@@ -1233,6 +1306,70 @@ WantedBy=sysinit.target
 EOF
 }
 
+print_camera_hint() {
+  local has_hs=0 has_xhci=0 has_cam=0
+  if [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1; then
+    has_hs=1
+  fi
+  if [[ -d /sys/bus/pci/drivers/xhci_hcd ]] && ls /sys/bus/pci/drivers/xhci_hcd/0000:* >/dev/null 2>&1; then
+    has_hs=1
+    has_xhci=1
+  fi
+  if ls /dev/video* >/dev/null 2>&1; then
+    has_cam=1
+  fi
+
+  cat <<'EOF'
+
+=== USB camera — guest script cannot attach it ===============================
+Spoofing this VM as a Latitude does not create a built-in webcam. A UVC
+camera only appears after VMware passes it through (Removable Devices).
+EOF
+  if [[ "${has_cam}" -eq 1 ]]; then
+    echo "This guest already has /dev/video* — camera is on the bus."
+    ls -l /dev/video* 2>/dev/null || true
+    return 0
+  fi
+  echo "No /dev/video* right now — nothing to detect in Chrome / Snapshot / Zoom."
+  if [[ "${has_hs}" -eq 0 ]]; then
+    cat <<'EOF'
+
+USB 2.0/3.0 is missing. UVC will not bind on the USB 1.1 hub (Bus 001).
+Power the VM fully OFF. In VMware: VM -> Settings -> USB Controller:
+  - USB compatibility: USB 3.1 or USB 2.0 (not 1.1)
+Then add to the .vmx (do not use CPUID masks):
+
+  usb.present = "TRUE"
+  ehci.present = "TRUE"
+  usb_xhci.present = "TRUE"
+
+Power on. Then: VM -> Removable Devices -> (camera) -> Connect (Disconnect from host).
+EOF
+  else
+    if [[ "${has_xhci}" -eq 0 ]]; then
+      echo
+      echo "USB 2.0 (EHCI) is present; USB 3.x (xHCI) is not. Cheap UVC cams often"
+      echo "need USB 3.1: power the VM OFF, set USB compatibility to USB 3.1, power on."
+    else
+      echo
+      echo "USB 2.0/3.x controller is already in this guest."
+    fi
+    cat <<'EOF'
+
+Connect the camera from the *host* (the guest cannot steal it):
+  1. Click into the VM.
+  2. VM -> Removable Devices -> your camera -> Connect (Disconnect from host).
+  3. If it does not stay connected, power the VM fully off (not suspend),
+     set USB compatibility to USB 3.1, power on, connect again.
+
+Then check with the real binary (not the lsusb wrapper):
+
+  /usr/bin/lsusb.real
+  ls -l /dev/video*
+EOF
+  fi
+}
+
 print_vmx_hint() {
   cat <<'EOF'
 
@@ -1250,25 +1387,9 @@ Do not add these (and remove them if you already did):
 Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl, lspci, lsusb, ps, lsblk, and ethtool.
 Tools still run, but under the process name gsd-disk-mon and dirs gsd-hw-helper / hw-assist-cfg.
 Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
-
-=== USB camera (Sunplus) — guest script cannot attach it ======================
-Your lsusb shows the camera is NOT on the guest bus (no 1bcf, no /dev/video*).
-UVC cameras need USB 2.0 or 3.0. The VMware virtual hub sits on USB 1.1
-(Bus 001). Connect will fail until the VM has EHCI or xHCI.
-
-Power the VM fully OFF. In VMware: VM -> Settings -> USB Controller:
-  - USB compatibility: USB 3.1 or USB 2.0 (not 1.1)
-Then add to the .vmx (do not use CPUID masks):
-
-  usb.present = "TRUE"
-  ehci.present = "TRUE"
-  usb_xhci.present = "TRUE"
-
-Power on. Connect the camera from Removable Devices again.
-Check with the real binary (not the wrapper):
-
-  /usr/bin/lsusb.real | grep -iE 'sunplus|1bcf|camera'
-  ls -l /dev/video*
+EOF
+  print_camera_hint
+  cat <<'EOF'
 
 If you already added CPUID mask lines: shut the VM fully off, delete them from
 the .vmx, save, power on. Then:
@@ -1317,8 +1438,9 @@ cmd_install() {
   restart_user_audio
   echo
   echo "installed. identity is applied and will re-apply at boot."
+  echo "Audio: WirePlumber now forces VM ALSA headroom (cloaked virt skipped it)."
   echo "Headset: log out/in once, then unplug/replug the USB mic if it still chops."
-  echo "USB camera: the guest cannot attach it. VM needs USB 2.0/3.0 (see hint)."
+  echo "Camera: spoofing DMI does not add a webcam. Connect USB from the VMware menu."
   print_vmx_hint
   cmd_status
 }
@@ -1472,6 +1594,62 @@ cmd_status() {
     fi
   fi
   echo "(Close and reopen GNOME Disks if it still shows VMware — it caches drive names.)"
+  echo
+  echo "=== audio (virt is cloaked; VM ALSA headroom must be forced) ==="
+  if [[ -f "${WIREPLUMBER_LUA}" ]]; then
+    echo "wireplumber rules:     ${WIREPLUMBER_LUA}"
+  else
+    echo "wireplumber rules:     MISSING — re-run: sudo bash $0 install"
+  fi
+  if [[ -f "${PIPEWIRE_CONF}" ]]; then
+    echo "pipewire clock drop-in: ${PIPEWIRE_CONF}"
+  else
+    echo "pipewire clock drop-in: MISSING"
+  fi
+  if [[ -r /proc/asound/cards ]]; then
+    echo "ALSA cards:"
+    sed 's/^/  /' /proc/asound/cards
+  fi
+  local pw_uid pw_run
+  pw_uid="$(loginctl list-users --no-legend 2>/dev/null | awk '$1!="0"{print $1; exit}')"
+  if [[ -n "${pw_uid}" ]]; then
+    pw_run="/run/user/${pw_uid}"
+    if [[ -S "${pw_run}/pipewire-0" ]]; then
+      echo "PipeWire clock:"
+      XDG_RUNTIME_DIR="${pw_run}" pw-metadata -n settings 2>/dev/null \
+        | grep -E "clock\.(quantum|min-quantum|max-quantum|rate)" \
+        | sed 's/^/  /' || true
+      echo "ALSA node headroom/period (must be 8192 / 1024):"
+      XDG_RUNTIME_DIR="${pw_run}" pw-dump 2>/dev/null | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+found=False
+for o in d:
+    info=o.get("info") or {}
+    p=info.get("props") or {}
+    if p.get("media.class") not in ("Audio/Sink","Audio/Source"):
+        continue
+    found=True
+    kv={}
+    for item in (info.get("params") or {}).get("Props") or []:
+        pr=item.get("params") if isinstance(item, dict) else None
+        if not isinstance(pr, list):
+            continue
+        it=iter(pr)
+        kv.update(zip(it, it))
+    print("  %s  period=%s  headroom=%s  suspend=%s" % (
+        p.get("node.name","?"),
+        kv.get("api.alsa.period-size", p.get("api.alsa.period-size","(unset)")),
+        kv.get("api.alsa.headroom", p.get("api.alsa.headroom","(unset)")),
+        p.get("session.suspend-timeout-seconds","(default)")))
+if not found:
+    print("  (no Audio/Sink or Audio/Source nodes)")
+' 2>/dev/null || echo "  (pw-dump not available)"
+    fi
+  fi
   if command -v lsusb >/dev/null 2>&1; then
     echo
     echo "=== lsusb (wrapped; VMware mouse/hub names rewritten) ==="
@@ -1482,6 +1660,13 @@ cmd_status() {
   fi
   echo
   echo "=== USB camera (kernel; wrapper cannot hide a missing device) ==="
+  echo "USB host controllers:"
+  if [[ -x "${LSPCI_REAL}" ]]; then
+    "${LSPCI_REAL}" -nn 2>/dev/null | grep -i 'USB controller' | sed 's/^/  /' || true
+  else
+    ls /sys/bus/pci/drivers/uhci_hcd/0000:* /sys/bus/pci/drivers/ehci-pci/0000:* \
+      /sys/bus/pci/drivers/xhci_hcd/0000:* 2>/dev/null | sed 's/^/  /' || true
+  fi
   if [[ -x "${LSUSB_REAL}" ]]; then
     echo "--- lsusb.real ---"
     "${LSUSB_REAL}" || true
@@ -1490,7 +1675,13 @@ cmd_status() {
     ls -l /dev/video*
   else
     echo "no /dev/video* — camera is not on the guest USB bus."
-    echo "Power the VM off and set USB compatibility to 3.1 or 2.0 (not 1.1)."
+    echo "Spoofing DMI as a Latitude does not create a webcam."
+    if [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1; then
+      echo "USB 2.0 is already present. Connect the camera from the VMware menu:"
+      echo "  VM -> Removable Devices -> (camera) -> Connect (Disconnect from host)"
+    else
+      echo "Power the VM off and set USB compatibility to 3.1 or 2.0 (not 1.1)."
+    fi
   fi
 }
 
