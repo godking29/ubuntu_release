@@ -1164,7 +1164,9 @@ EOF
   -e 's/0e0f:0006/8087:0024/g' \
   -e 's/VMware Virtual Mouse/M105 Optical Mouse/g' \
   -e 's/VMware Virtual USB Mouse/M105 Optical Mouse/g' \
-  -e 's/VMware Virtual USB Hub/Integrated Rate Matching Hub/g'
+  -e 's/VMware Virtual USB Hub/Integrated Rate Matching Hub/g' \
+  -e 's/VMware Virtual USB Video Device/Integrated Webcam/g' \
+  -e 's/VMware USB Video Device/Integrated Webcam/g'
 EOF
   chmod 755 "${LSUSB_BIN}"
   fi
@@ -1181,7 +1183,8 @@ EOF
   -e 's/Vendor=0e0f ProdID=0006/Vendor=8087 ProdID=0024/g' \
   -e 's/Product=VMware Virtual USB Mouse/Product=M105 Optical Mouse/g' \
   -e 's/Product=VMware Virtual Mouse/Product=M105 Optical Mouse/g' \
-  -e 's/Product=VMware Virtual USB Hub/Product=Integrated Rate Matching Hub/g'
+  -e 's/Product=VMware Virtual USB Hub/Product=Integrated Rate Matching Hub/g' \
+  -e 's/Product=VMware Virtual USB Video Device/Product=Integrated Webcam/g'
 EOF
   chmod 755 "${USBDEVICES_BIN}"
   fi
@@ -1387,57 +1390,64 @@ EOF
 
   cat <<'EOF'
 
-Stage 1 — HOST (power the VM fully OFF, not Suspend). Do not add CPUID masks.
+Workstation 25H2 USB compatibility is USB 1.1, USB 2.0, or USB 3.2
+(there is no "USB 3.1" item; 3.2 is the xHCI option). Webcams need
+isochronous USB: pick USB 2.0 or USB 3.2, never 1.1.
 
-A. Close host Camera / Teams / Zoom / Chrome. Windows Privacy > Camera:
-   allow desktop apps, then close those apps so Frame Server releases it.
-   services.msc → VMware USB Arbitration Service → Restart (startup Automatic).
+Your lsusb.real shows leftover mixed controllers after choosing 3.2:
 
-B. VM Settings → USB Controller → USB compatibility = USB 2.0
-   (Sunplus UVC; USB 3.1 + leftover EHCI together is a common 25H2 failure).
+  Bus 001  USB 1.1 UHCI  + virtual hub     ← old usb.present
+  Bus 002  USB 2.0 EHCI  empty             ← leftover ehci.present
+  Bus 003  xHCI USB 2.0  mouse + 2 hubs
+  Bus 004  xHCI USB 3.0  empty             ← camera should land here
+  no Sunplus, no Virtual USB Video, no /dev/video*
 
-C. Edit the .vmx (same folder as the VM). Keep ONE controller, force
-   passthrough, disable VMware's virtual camera (Windows 11 intercepts UVC):
+The GUI "USB 3.2" checkbox ADDS xHCI. It does not delete UHCI/EHCI
+already in the .vmx. VMware then often hangs the camera off the 1.1
+hub and reports "connection was unsuccessful".
 
-     usb.present = "TRUE"
-     ehci.present = "TRUE"
-     usb_xhci.present = "FALSE"
-     usb.generic.allowHID = "TRUE"
-     vusb.camera = "FALSE"
-     vusbcamera.passthrough = "TRUE"
+Fix the .vmx while the VM is Powered Off (not Suspend). Exit Workstation
+first. In the .vmx, make USB look like this (one of each, no duplicates):
 
-   If USB 2.0 still fails, power off and switch to USB 3.1 ONLY:
+  usb.present = "TRUE"
+  ehci.present = "FALSE"
+  usb_xhci.present = "TRUE"
+  usb.generic.allowHID = "TRUE"
 
-     usb.present = "TRUE"
-     ehci.present = "FALSE"
-     usb_xhci.present = "TRUE"
-     usb.generic.allowHID = "TRUE"
-     vusb.camera = "FALSE"
-     vusbcamera.passthrough = "TRUE"
+If UHCI Bus 001 is still there after reboot, drop UHCI too (virtual
+mouse already sits on xHCI Bus 003 in your dump):
 
-D. After a failed Connect, open vmware.log next to the .vmx and search
-   "USB: Found device". Note vid: and pid: (Sunplus is often 1bcf). Add ONE
-   line (Broadcom KB 315312), power off between tries:
+  usb.present = "FALSE"
+  ehci.present = "FALSE"
+  usb_xhci.present = "TRUE"
+  usb.generic.allowHID = "TRUE"
 
-     usb.quirks.device0 = "0xVID:0xPID skip-reset"
-     usb.quirks.device0 = "0xVID:0xPID skip-refresh"
-     usb.quirks.device0 = "0xVID:0xPID skip-setconfig"
-     usb.quirks.device0 = "0xVID:0xPID skip-reset, skip-refresh, skip-setconfig"
+Also: VM Settings → Options → Advanced / Hardware compatibility:
+use Workstation 25H2 (or latest). USB 3.2 xHCI needs WS8+ hardware.
 
-   Example:
+Check with Notepad find (Ctrl+F) that you do not still have
+ehci.present = "TRUE" leftover.
 
-     usb.quirks.device0 = "0x1bcf:0x0c31 skip-reset, skip-refresh, skip-setconfig"
+On Windows, %APPDATA%\VMware\preferences.ini:
 
-E. Power on. Click into the VM. Then:
-     VM → Removable Devices → Sunplus Innovation USB Camera
-       → Connect (Disconnect from host)
+  vusb.camera = "TRUE"
+  vusbcamera.passthrough = "FALSE"
 
-F. Guest check (real binary, not the lsusb wrapper):
+Then power on, click into the guest. A shared camera appears as
+"VMware Virtual USB Video Device" without Connect-from-host.
 
-     /usr/bin/lsusb.real | grep -iE 'sunplus|1bcf|camera'
-     ls -l /dev/video*
+Connect (Disconnect from host) is passthrough. A laptop Sunplus is
+held by Windows Camera Frame Server; 25H2 often cannot steal it.
+Use that menu only for an external webcam, and only after the guest
+has xHCI without leftover UHCI/EHCI (lsusb.real: no Bus 001 1.1 hub,
+camera on Bus 003 or 004).
 
-A spoofed Latitude DMI does not create a built-in webcam.
+Guest check:
+
+  /usr/bin/lsusb.real
+  ls -l /dev/video*
+
+A spoofed Latitude DMI does not create a webcam.
 EOF
 }
 
