@@ -580,28 +580,34 @@ usb_has_av_interface() {
 }
 
 apply_usb_identity() {
-  local d vid
-  # Undo hub bind-mounts / udev from older script versions. The VMware
-  # virtual hub must stay untouched or Workstation cannot attach a USB camera.
-  unmount_usb_identity
-  mkdir -p "${RUNTIME_DIR}/usb"
+  local d
+  # Undo hub bind-mounts / 0e0f udev from older script versions. Do not
+  # bind-mount the VMware virtual USB hub — Workstation attaches cameras there.
   for d in /sys/bus/usb/devices/*; do
-    [[ -f "${d}/idVendor" ]] || continue
-    vid="$(tr -d '[:space:]' <"${d}/idVendor" 2>/dev/null || true)"
-    [[ "${vid}" == "0e0f" ]] || continue
-    usb_is_passthrough_path "${d}" && continue
-    usb_has_av_interface "${d}" && continue
-    # Do not bind-mount remaining 0e0f devices either — lsusb wrap is enough.
+    local key
+    for key in manufacturer product; do
+      if findmnt -n "${d}/${key}" >/dev/null 2>&1; then
+        umount "${d}/${key}" 2>/dev/null || umount -l "${d}/${key}" 2>/dev/null || true
+      fi
+    done
   done
+  rm -f "${UDEV_USB_RULE}"
+  mkdir -p "${RUNTIME_DIR}/usb"
   cat >"${UDEV_V4L_RULE}" <<'EOF'
-# make-real-laptop.sh — passthrough UVC cameras (e.g. Sunplus) need uaccess
+# make-real-laptop.sh — passthrough UVC cameras need uaccess
 SUBSYSTEM=="video4linux", GROUP="video", MODE="0660", TAG+="uaccess"
 KERNEL=="video[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess"
 EOF
   if command -v udevadm >/dev/null 2>&1; then
     udevadm control --reload-rules 2>/dev/null || true
   fi
+  # UVC cameras need USB 2/3 (ehci/xhci). USB 1.1 UHCI will not create /dev/video*.
+  modprobe ehci-pci 2>/dev/null || true
+  modprobe ehci-hcd 2>/dev/null || true
+  modprobe xhci_pci 2>/dev/null || true
+  modprobe xhci_hcd 2>/dev/null || true
   modprobe uvcvideo 2>/dev/null || true
+  modprobe snd-usb-audio 2>/dev/null || true
   local user
   if getent group video >/dev/null 2>&1; then
     while read -r _ user _; do
@@ -631,14 +637,12 @@ apply_audio_vm_buffers() {
     /etc/wireplumber/main.lua.d /etc/wireplumber/wireplumber.conf.d \
     /etc/environment.d
   cat >"${PIPEWIRE_CONF}" <<'EOF'
-# make-real-laptop.sh — systemd-detect-virt is cloaked to "none", so PipeWire
-# would pick laptop low-latency quanta. This guest is still a VM; USB mics chop
-# unless the quantum stays large.
+# make-real-laptop.sh — virt is cloaked; keep VM-sized buffers for USB mics.
 context.properties = {
     default.clock.rate        = 48000
-    default.clock.quantum     = 1024
+    default.clock.quantum     = 2048
     default.clock.min-quantum = 1024
-    default.clock.max-quantum = 2048
+    default.clock.max-quantum = 4096
 }
 EOF
   cat >"${PIPEWIRE_PULSE_CONF}" <<'EOF'
@@ -646,23 +650,34 @@ EOF
 pulse.properties = {
     pulse.min.req          = 1024/48000
     pulse.min.quantum      = 1024/48000
-    pulse.default.req      = 1024/48000
-    pulse.default.frag     = 1024/48000
+    pulse.default.req      = 2048/48000
+    pulse.default.frag     = 2048/48000
 }
 EOF
   cat >"${WIREPLUMBER_LUA}" <<'EOF'
--- make-real-laptop.sh (WirePlumber 0.4) — ALSA only. Do not touch v4l2/libcamera.
+-- make-real-laptop.sh (WirePlumber 0.4) — ALSA only, not v4l2.
 if alsa_monitor ~= nil and alsa_monitor.properties ~= nil then
   alsa_monitor.properties["session.suspend-timeout-seconds"] = 0
 end
 EOF
-  # Do not write wireplumber.conf.d: on 0.4 it can break the v4l2 camera monitor.
-  rm -f "${WIREPLUMBER_CONF}"
-  cat >"${PULSE_ENV}" <<'EOF'
-PIPEWIRE_LATENCY=1024/48000
-PULSE_LATENCY_MSEC=60
+  # 0.4 uses lua only. A .conf drop-in on 0.4 can break the v4l2 monitor.
+  local wp_ver=""
+  wp_ver="$(dpkg-query -W -f='${Version}' wireplumber 2>/dev/null || true)"
+  if [[ -n "${wp_ver}" ]] && dpkg --compare-versions "${wp_ver}" ge 0.5 2>/dev/null; then
+    mkdir -p "$(dirname "${WIREPLUMBER_CONF}")"
+    cat >"${WIREPLUMBER_CONF}" <<'EOF'
+# make-real-laptop.sh (WirePlumber 0.5) — ALSA fragment only; v4l2 stays default.
+monitor.alsa.properties = {
+  ["session.suspend-timeout-seconds"] = 0
+}
 EOF
-  restart_user_audio
+  else
+    rm -f "${WIREPLUMBER_CONF}"
+  fi
+  cat >"${PULSE_ENV}" <<'EOF'
+PIPEWIRE_LATENCY=2048/48000
+PULSE_LATENCY_MSEC=80
+EOF
 }
 
 remove_audio_vm_buffers() {
@@ -1065,19 +1080,14 @@ EOF
   -e 's/ID 0e0f:0003 VMware, Inc\. Virtual Mouse/ID 046d:c077 Logitech, Inc. M105 Optical Mouse/g' \
   -e 's/ID 0e0f:0001 VMware, Inc\. .*/ID 046d:c077 Logitech, Inc. M105 Optical Mouse/g' \
   -e 's/ID 0e0f:0002 VMware, Inc\. Virtual USB Hub/ID 8087:0024 Intel Corp. Integrated Rate Matching Hub/g' \
+  -e 's/ID 0e0f:0006 VMware, Inc\. Virtual USB Hub/ID 8087:0024 Intel Corp. Integrated Rate Matching Hub/g' \
   -e 's/0e0f:0003/046d:c077/g' \
   -e 's/0e0f:0001/046d:c077/g' \
   -e 's/0e0f:0002/8087:0024/g' \
-  -e 's/idVendor[[:space:]]*0x0e0f/idVendor           0x046d/g' \
-  -e 's/idProduct[[:space:]]*0x0003/idProduct          0xc077/g' \
-  -e 's/idProduct[[:space:]]*0x0002/idProduct          0x0024/g' \
-  -e 's/VMware, Inc\./Logitech, Inc./g' \
+  -e 's/0e0f:0006/8087:0024/g' \
   -e 's/VMware Virtual Mouse/M105 Optical Mouse/g' \
   -e 's/VMware Virtual USB Mouse/M105 Optical Mouse/g' \
-  -e 's/Virtual Mouse/M105 Optical Mouse/g' \
-  -e 's/VMware Virtual USB Hub/Integrated Rate Matching Hub/g' \
-  -e 's/Virtual USB Hub/Integrated Rate Matching Hub/g' \
-  | grep -viE 'vmware|0e0f' || true
+  -e 's/VMware Virtual USB Hub/Integrated Rate Matching Hub/g'
 EOF
   chmod 755 "${LSUSB_BIN}"
   fi
@@ -1091,11 +1101,10 @@ EOF
   -e 's/Vendor=0e0f ProdID=0003/Vendor=046d ProdID=c077/g' \
   -e 's/Vendor=0e0f ProdID=0001/Vendor=046d ProdID=c077/g' \
   -e 's/Vendor=0e0f ProdID=0002/Vendor=8087 ProdID=0024/g' \
-  -e 's/Manufacturer=VMware, Inc\./Manufacturer=Logitech, Inc./g' \
+  -e 's/Vendor=0e0f ProdID=0006/Vendor=8087 ProdID=0024/g' \
   -e 's/Product=VMware Virtual USB Mouse/Product=M105 Optical Mouse/g' \
   -e 's/Product=VMware Virtual Mouse/Product=M105 Optical Mouse/g' \
-  -e 's/Product=VMware Virtual USB Hub/Product=Integrated Rate Matching Hub/g' \
-  | grep -viE 'vmware|0e0f' || true
+  -e 's/Product=VMware Virtual USB Hub/Product=Integrated Rate Matching Hub/g'
 EOF
   chmod 755 "${USBDEVICES_BIN}"
   fi
@@ -1242,7 +1251,26 @@ Guest wrappers already hide VMware from systemd-detect-virt, lscpu, hostnamectl,
 Tools still run, but under the process name gsd-disk-mon and dirs gsd-hw-helper / hw-assist-cfg.
 Leave the .vmx CPUID alone so Chrome and VMware Tools keep working.
 
-If you already added those lines: shut the VM fully off, delete them from
+=== USB camera (Sunplus) — guest script cannot attach it ======================
+Your lsusb shows the camera is NOT on the guest bus (no 1bcf, no /dev/video*).
+UVC cameras need USB 2.0 or 3.0. The VMware virtual hub sits on USB 1.1
+(Bus 001). Connect will fail until the VM has EHCI or xHCI.
+
+Power the VM fully OFF. In VMware: VM -> Settings -> USB Controller:
+  - USB compatibility: USB 3.1 or USB 2.0 (not 1.1)
+Then add to the .vmx (do not use CPUID masks):
+
+  usb.present = "TRUE"
+  ehci.present = "TRUE"
+  usb_xhci.present = "TRUE"
+
+Power on. Connect the camera from Removable Devices again.
+Check with the real binary (not the wrapper):
+
+  /usr/bin/lsusb.real | grep -iE 'sunplus|1bcf|camera'
+  ls -l /dev/video*
+
+If you already added CPUID mask lines: shut the VM fully off, delete them from
 the .vmx, save, power on. Then:
 
   sudo apt-get install --reinstall -y open-vm-tools open-vm-tools-desktop
@@ -1286,12 +1314,11 @@ cmd_install() {
   systemctl daemon-reload
   systemctl enable make-real-laptop.service
   cmd_apply
+  restart_user_audio
   echo
   echo "installed. identity is applied and will re-apply at boot."
-  echo "Log out of GNOME only if status still lists a vmtoolsd process."
-  echo "USB camera: VM Settings -> Removable Devices -> camera -> Connect, then:"
-  echo "  lsusb | grep -iE 'sunplus|camera|1bcf'; ls -l /dev/video*"
-  echo "Log out/in once if you were just added to the video group."
+  echo "Headset: log out/in once, then unplug/replug the USB mic if it still chops."
+  echo "USB camera: the guest cannot attach it. VM needs USB 2.0/3.0 (see hint)."
   print_vmx_hint
   cmd_status
 }
@@ -1447,11 +1474,23 @@ cmd_status() {
   echo "(Close and reopen GNOME Disks if it still shows VMware — it caches drive names.)"
   if command -v lsusb >/dev/null 2>&1; then
     echo
-    echo "=== lsusb (VMware / 0e0f must be absent) ==="
+    echo "=== lsusb (wrapped; VMware mouse/hub names rewritten) ==="
     lsusb
     if lsusb | grep -Ei 'vmware|0e0f'; then
       echo "NOTE: lsusb still names VMware USB — re-run: sudo bash $0 install"
     fi
+  fi
+  echo
+  echo "=== USB camera (kernel; wrapper cannot hide a missing device) ==="
+  if [[ -x "${LSUSB_REAL}" ]]; then
+    echo "--- lsusb.real ---"
+    "${LSUSB_REAL}" || true
+  fi
+  if ls /dev/video* >/dev/null 2>&1; then
+    ls -l /dev/video*
+  else
+    echo "no /dev/video* — camera is not on the guest USB bus."
+    echo "Power the VM off and set USB compatibility to 3.1 or 2.0 (not 1.1)."
   fi
 }
 
