@@ -600,17 +600,16 @@ apply_usb_identity() {
   cat >"${UDEV_V4L_RULE}" <<'EOF'
 # make-real-laptop.sh — passthrough UVC cameras need uaccess
 # Do not `udevadm trigger -s usb` after writing this (glitches USB mics).
+# Do not ATTR{power/control} on USB add: that can abort VMware passthrough
+# ("The connection for the USB device was unsuccessful").
 SUBSYSTEM=="video4linux", GROUP="video", MODE="0660", TAG+="uaccess", TAG+="seat"
 KERNEL=="video[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess", TAG+="seat"
 KERNEL=="media[0-9]*", GROUP="video", MODE="0660", TAG+="uaccess"
-# Isochronous devices in a VM fail if the host autosuspends them.
-ACTION=="add", SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:0e*:*", ATTR{power/control}="on"
-ACTION=="add", SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:01*:*", ATTR{power/control}="on"
 EOF
   cat >"${MODPROBE_USB}" <<'EOF'
 # make-real-laptop.sh — VMware USB isochronous (UVC / headset) needs this.
 options usbcore autosuspend=-1
-options uvcvideo nodrop=1 timeout=5000
+options uvcvideo timeout=5000
 EOF
   echo -1 >/sys/module/usbcore/parameters/autosuspend 2>/dev/null || true
   if command -v udevadm >/dev/null 2>&1; then
@@ -630,13 +629,6 @@ EOF
       [[ -n "${user}" && "${user}" != "root" ]] || continue
       usermod -aG "${grp}" "${user}" 2>/dev/null || true
     done < <(loginctl list-users --no-legend 2>/dev/null || true)
-  done
-  # Already-attached UVC/headset: disable autosuspend without a USB retrigger.
-  for d in /sys/bus/usb/devices/*; do
-    [[ -f "${d}/idVendor" ]] || continue
-    usb_has_av_interface "${d}" || continue
-    echo on >"${d}/power/control" 2>/dev/null || true
-    echo -1 >"${d}/power/autosuspend" 2>/dev/null || true
   done
 }
 
@@ -1307,67 +1299,97 @@ EOF
 }
 
 print_camera_hint() {
-  local has_hs=0 has_xhci=0 has_cam=0
-  if [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1; then
-    has_hs=1
-  fi
+  local has_uhci=0 has_ehci=0 has_xhci=0 has_cam=0 mixed=0
+  [[ -d /sys/bus/pci/drivers/uhci_hcd ]] && ls /sys/bus/pci/drivers/uhci_hcd/0000:* >/dev/null 2>&1 && has_uhci=1
+  [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1 && has_ehci=1
   if [[ -d /sys/bus/pci/drivers/xhci_hcd ]] && ls /sys/bus/pci/drivers/xhci_hcd/0000:* >/dev/null 2>&1; then
-    has_hs=1
     has_xhci=1
   fi
   if ls /dev/video* >/dev/null 2>&1; then
     has_cam=1
   fi
+  if [[ $((has_uhci + has_ehci + has_xhci)) -gt 1 ]]; then
+    mixed=1
+  fi
 
   cat <<'EOF'
 
-=== USB camera — guest script cannot attach it ===============================
-Spoofing this VM as a Latitude does not create a built-in webcam. A UVC
-camera only appears after VMware passes it through (Removable Devices).
+=== USB camera — "connection was unsuccessful" is a HOST/VMware failure =====
+The guest script cannot attach a camera. If VMware says the connection was
+unsuccessful, the device never reaches Linux (no /dev/video*). That is not
+a Cheese/Chrome/Zoom bug.
+
+This guest currently has:
 EOF
+  echo "  UHCI (USB 1.1): $([[ ${has_uhci} -eq 1 ]] && echo yes || echo no)"
+  echo "  EHCI (USB 2.0): $([[ ${has_ehci} -eq 1 ]] && echo yes || echo no)"
+  echo "  xHCI (USB 3.x): $([[ ${has_xhci} -eq 1 ]] && echo yes || echo no)"
   if [[ "${has_cam}" -eq 1 ]]; then
-    echo "This guest already has /dev/video* — camera is on the bus."
+    echo "  /dev/video*: present"
     ls -l /dev/video* 2>/dev/null || true
     return 0
   fi
-  echo "No /dev/video* right now — nothing to detect in Chrome / Snapshot / Zoom."
-  if [[ "${has_hs}" -eq 0 ]]; then
-    cat <<'EOF'
-
-USB 2.0/3.0 is missing. UVC will not bind on the USB 1.1 hub (Bus 001).
-Power the VM fully OFF. In VMware: VM -> Settings -> USB Controller:
-  - USB compatibility: USB 3.1 or USB 2.0 (not 1.1)
-Then add to the .vmx (do not use CPUID masks):
-
-  usb.present = "TRUE"
-  ehci.present = "TRUE"
-  usb_xhci.present = "TRUE"
-
-Power on. Then: VM -> Removable Devices -> (camera) -> Connect (Disconnect from host).
-EOF
-  else
-    if [[ "${has_xhci}" -eq 0 ]]; then
-      echo
-      echo "USB 2.0 (EHCI) is present; USB 3.x (xHCI) is not. Cheap UVC cams often"
-      echo "need USB 3.1: power the VM OFF, set USB compatibility to USB 3.1, power on."
-    else
-      echo
-      echo "USB 2.0/3.x controller is already in this guest."
-    fi
-    cat <<'EOF'
-
-Connect the camera from the *host* (the guest cannot steal it):
-  1. Click into the VM.
-  2. VM -> Removable Devices -> your camera -> Connect (Disconnect from host).
-  3. If it does not stay connected, power the VM fully off (not suspend),
-     set USB compatibility to USB 3.1, power on, connect again.
-
-Then check with the real binary (not the lsusb wrapper):
-
-  /usr/bin/lsusb.real
-  ls -l /dev/video*
-EOF
+  echo "  /dev/video*: none"
+  if [[ "${mixed}" -eq 1 ]]; then
+    echo
+    echo "All three USB stacks are present. VMware then often fails UVC attach"
+    echo "with exactly \"The connection for the USB device was unsuccessful\"."
   fi
+
+  cat <<'EOF'
+
+Do this on the HOST (power the VM fully OFF — not Suspend):
+
+1. Close anything on the host that owns the camera (Camera app, Teams, Zoom,
+   Chrome). On Windows: restart "VMware USB Arbitration Service" in services.msc.
+
+2. Pick ONE USB controller, not USB 2 + USB 3 together.
+   VM -> Settings -> USB Controller -> USB compatibility:
+
+   First try: USB 2.0   (best for cheap Sunplus/UVC cams)
+   If that still fails: USB 3.1
+
+3. Edit the .vmx next to the .vmx you open in Workstation. Remove leftover
+   lines from the other compatibility. For USB 2.0 only:
+
+     usb.present = "TRUE"
+     ehci.present = "TRUE"
+     usb_xhci.present = "FALSE"
+
+   For USB 3.1 only:
+
+     usb.present = "TRUE"
+     ehci.present = "FALSE"
+     usb_xhci.present = "TRUE"
+
+   Also add (do not use CPUID masks):
+
+     usb.generic.allowHID = "TRUE"
+
+4. Webcam quirks (Broadcom KB 315312). In the same folder as the .vmx, open
+   vmware.log after a failed connect and search for "USB: Found device".
+   Note vid: and pid:, then add ONE of these lines (try in this order,
+   power off between tries):
+
+     usb.quirks.device0 = "0xVID:0xPID skip-reset"
+     usb.quirks.device0 = "0xVID:0xPID skip-refresh"
+     usb.quirks.device0 = "0xVID:0xPID skip-setconfig"
+     usb.quirks.device0 = "0xVID:0xPID skip-reset, skip-refresh, skip-setconfig"
+
+   Example if the log says vid:1bcf pid:0c31:
+
+     usb.quirks.device0 = "0x1bcf:0x0c31 skip-reset, skip-refresh, skip-setconfig"
+
+5. Power on. Click into the VM. Then:
+     VM -> Removable Devices -> (camera) -> Connect (Disconnect from host)
+
+6. In the guest:
+
+     /usr/bin/lsusb.real
+     ls -l /dev/video*
+
+A spoofed Latitude DMI does not create a built-in webcam.
+EOF
 }
 
 print_vmx_hint() {
@@ -1440,7 +1462,7 @@ cmd_install() {
   echo "installed. identity is applied and will re-apply at boot."
   echo "Audio: WirePlumber now forces VM ALSA headroom (cloaked virt skipped it)."
   echo "Headset: log out/in once, then unplug/replug the USB mic if it still chops."
-  echo "Camera: spoofing DMI does not add a webcam. Connect USB from the VMware menu."
+  echo "Camera: if VMware says connection unsuccessful, run: bash $0 camera"
   print_vmx_hint
   cmd_status
 }
@@ -1676,22 +1698,22 @@ if not found:
   else
     echo "no /dev/video* — camera is not on the guest USB bus."
     echo "Spoofing DMI as a Latitude does not create a webcam."
-    if [[ -d /sys/bus/pci/drivers/ehci-pci ]] && ls /sys/bus/pci/drivers/ehci-pci/0000:* >/dev/null 2>&1; then
-      echo "USB 2.0 is already present. Connect the camera from the VMware menu:"
-      echo "  VM -> Removable Devices -> (camera) -> Connect (Disconnect from host)"
-    else
-      echo "Power the VM off and set USB compatibility to 3.1 or 2.0 (not 1.1)."
-    fi
+    echo "If VMware said \"connection was unsuccessful\", the host never passed"
+    echo "the device in. This guest has mixed USB 1.1+2.0+3.x controllers — that"
+    echo "is a common cause. See:  bash $0 camera"
   fi
 }
 
 usage() {
   cat <<EOF
 Usage: sudo $0 <install|apply|status|revert>
+       $0 camera
+       $0 status
 
   install   copy to /usr/local/sbin, enable boot service, apply now
   apply     spoof DMI / cpuinfo / disks / hostname / virt wrappers (once)
   status    print current identity
+  camera    print host-side USB camera / "connection unsuccessful" steps
   revert    undo overlays, wrapper, hostname, and boot service
 EOF
 }
@@ -1702,6 +1724,7 @@ main() {
     install) need_root install; cmd_install ;;
     apply)   need_root apply; cmd_apply ;;
     status)  cmd_status ;;
+    camera)  print_camera_hint ;;
     revert)  need_root revert; cmd_revert ;;
     -h|--help|help|"") usage ;;
     *) usage; die "unknown command: ${cmd}" ;;
